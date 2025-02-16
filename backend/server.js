@@ -39,7 +39,7 @@ app.post("/api/flights", async (req, res) => {
     return res.status(400).json({ error: "Missing required fields" });
   }
 
-  const apiKey = "dee1edacf0b5c12c2a58d666170521363f340def06dcc8703587293f84598d75";
+  const apiKey = "dee1edacf0b5c12a58d666170521363f340def06dcc8703587293f84598d75";
   const serpApiUrl = `https://serpapi.com/search.json?engine=google_flights&type=2&departure_id=${source}&arrival_id=${destination}&outbound_date=${date}&currency=USD&hl=en&api_key=${apiKey}`;
 
   logger.info(`Fetching flights from URL: ${serpApiUrl}`);
