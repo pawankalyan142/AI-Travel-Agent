@@ -1,0 +1,448 @@
+name: AI Code Review (Final)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+env:
+  CHUNK_SIZE: 200
+  MAX_TOTAL_LINES: 1000
+  CONTEXT_LINES: 5        # Lines to read before & after from actual file
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  ai-code-review:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Checkout full repo on runner machine
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Step 2: Check if AI already reviewed this PR
+      - name: Check if AI already reviewed this PR
+        id: check_reviewed
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 << 'EOF'
+          import urllib.request
+          import json
+          import os
+
+          token = os.environ["GITHUB_TOKEN"]
+          repo = os.environ["REPO"]
+          pr_number = os.environ["PR_NUMBER"]
+
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments?per_page=100",
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github.v3+json"
+              }
+          )
+
+          with urllib.request.urlopen(req) as response:
+              comments = json.loads(response.read())
+
+          already_reviewed = any(
+              "AI Code Review Complete" in c.get("body", "") or
+              "AI Code Review Skipped" in c.get("body", "")
+              for c in comments
+          )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"already_reviewed={'true' if already_reviewed else 'false'}\n")
+
+          print(f"Already reviewed: {already_reviewed}")
+          EOF
+
+      # Step 3: Stop if already reviewed
+      - name: Post already reviewed comment and stop
+        if: steps.check_reviewed.outputs.already_reviewed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments" \
+            -d "{
+              \"body\": \"## ℹ️ AI Review Already Done\n\n✅ AI has already reviewed this PR once. No further AI reviews will run.\n\n**Next step:** Please fix the AI comments and request a **peer review** from your teammates.\"
+            }"
+
+      # Step 4: Get diff — only source files, count only added lines
+      - name: Get PR diff and validate size
+        if: steps.check_reviewed.outputs.already_reviewed == 'false'
+        id: validate_diff
+        run: |
+          git diff origin/${{ github.base_ref }}...HEAD \
+            -- '*.py' '*.js' '*.ts' '*.tsx' '*.jsx' \
+               '*.java' '*.go' '*.rb' '*.php' '*.cs' \
+               '*.cpp' '*.c' '*.h' '*.rs' '*.swift' \
+               '*.kt' '*.scala' '*.yaml' '*.yml' '*.json' \
+               '*.html' '*.css' '*.scss' \
+            > pr_diff.txt
+
+          ADDED_LINES=$(grep -c '^+[^+]' pr_diff.txt || true)
+          echo "Added lines in diff: $ADDED_LINES"
+          echo "total_lines=$ADDED_LINES" >> $GITHUB_OUTPUT
+
+          if [ "$ADDED_LINES" -gt "$MAX_TOTAL_LINES" ]; then
+            echo "too_large=true" >> $GITHUB_OUTPUT
+          else
+            echo "too_large=false" >> $GITHUB_OUTPUT
+          fi
+
+      # Step 5: Hard stop if exceeds MAX_TOTAL_LINES
+      - name: Comment PR too large and exit
+        if: steps.check_reviewed.outputs.already_reviewed == 'false' && steps.validate_diff.outputs.too_large == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments" \
+            -d "{
+              \"body\": \"## ⚠️ AI Code Review Skipped\n\n**Reason:** This PR has **${{ steps.validate_diff.outputs.total_lines }} added lines** which exceeds the maximum limit of 1000 lines.\n\n**Please split this PR into smaller focused PRs.**\"
+            }"
+          exit 0
+
+      # Step 6: Parse diff to get changed line numbers
+      #         Then read actual context from cloned repo files
+      - name: Parse diff and enrich with real file context
+        if: steps.check_reviewed.outputs.already_reviewed == 'false' && steps.validate_diff.outputs.too_large == 'false'
+        env:
+          CONTEXT_LINES: ${{ env.CONTEXT_LINES }}
+        run: |
+          python3 << 'EOF'
+          import json
+          import re
+          import os
+
+          context_size = int(os.environ.get("CONTEXT_LINES", 5))
+          changed_lines = []
+          current_file = None
+          new_line = 0
+
+          with open("pr_diff.txt", "r") as f:
+              raw_lines = f.readlines()
+
+          # Pass 1 — extract only added lines with file + line number from diff
+          for line in raw_lines:
+              if line.startswith("diff --git"):
+                  match = re.search(r'b/(.+)', line)
+                  if match:
+                      current_file = match.group(1).strip()
+
+              elif line.startswith("@@"):
+                  match = re.search(r'\+(\d+)', line)
+                  if match:
+                      new_line = int(match.group(1)) - 1
+
+              elif line.startswith("+") and not line.startswith("+++"):
+                  new_line += 1
+                  changed_lines.append({
+                      "file": current_file,
+                      "line": new_line,
+                      "content": line[1:].rstrip()
+                  })
+
+              elif not line.startswith("-") and not line.startswith("\\"):
+                  new_line += 1
+
+          # Pass 2 — for each changed line, read real context from cloned repo
+          diff_data = []
+
+          for entry in changed_lines:
+              file_path = entry["file"]
+              changed_line_num = entry["line"]
+
+              context_before = []
+              context_after = []
+
+              # Read directly from the actual file sitting on runner machine
+              if os.path.exists(file_path):
+                  with open(file_path, "r", errors="ignore") as f:
+                      all_file_lines = f.readlines()
+
+                  total_file_lines = len(all_file_lines)
+
+                  # Read N lines before the changed line
+                  start = max(0, changed_line_num - context_size - 1)
+                  end = changed_line_num - 1
+                  context_before = [
+                      f"line {start + i + 1}: {all_file_lines[start + i].rstrip()}"
+                      for i in range(end - start)
+                  ]
+
+                  # Read N lines after the changed line
+                  start_after = changed_line_num         # 0-indexed: line after
+                  end_after = min(total_file_lines, changed_line_num + context_size)
+                  context_after = [
+                      f"line {start_after + i + 1}: {all_file_lines[start_after + i].rstrip()}"
+                      for i in range(end_after - start_after)
+                  ]
+
+              diff_data.append({
+                  "file": file_path,
+                  "line": changed_line_num,
+                  "content": entry["content"],
+                  "context_before": context_before,
+                  "context_after": context_after
+              })
+
+          # Split into chunks of CHUNK_SIZE for OpenAI
+          chunk_size = int(os.environ.get("CHUNK_SIZE", 200))
+          chunks = [diff_data[i:i+chunk_size] for i in range(0, len(diff_data), chunk_size)]
+
+          with open("diff_chunks.json", "w") as f:
+              json.dump(chunks, f, indent=2)
+
+          print(f"Total changed lines: {len(diff_data)}")
+          print(f"Split into {len(chunks)} chunk(s) of {chunk_size} lines each")
+          EOF
+
+      # Step 7: Call OpenAI per chunk with real context, merge all comments
+      - name: Call OpenAI per chunk and collect comments
+        if: steps.check_reviewed.outputs.already_reviewed == 'false' && steps.validate_diff.outputs.too_large == 'false'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python3 << 'EOF'
+          import json
+          import urllib.request
+          import urllib.error
+          import os
+          import time
+
+          with open("diff_chunks.json", "r") as f:
+              chunks = json.load(f)
+
+          api_key = os.environ["OPENAI_API_KEY"]
+          all_comments = []
+
+          for idx, chunk in enumerate(chunks):
+              print(f"\n📦 Processing chunk {idx+1}/{len(chunks)} ({len(chunk)} lines)...")
+
+              # Build rich prompt with real file context for each line
+              diff_text = ""
+              for item in chunk:
+                  diff_text += f"\n---\n"
+                  diff_text += f"File: {item['file']} | Line: {item['line']}\n"
+
+                  if item["context_before"]:
+                      diff_text += "Context before (from actual file):\n"
+                      for c in item["context_before"]:
+                          diff_text += f"  {c}\n"
+
+                  diff_text += f">>> ADDED LINE {item['line']}: {item['content']}\n"
+
+                  if item["context_after"]:
+                      diff_text += "Context after (from actual file):\n"
+                      for c in item["context_after"]:
+                          diff_text += f"  {c}\n"
+
+              prompt = f"""You are an expert code reviewer. Below are newly added lines from a PR.
+              Each entry shows:
+              - The exact added line
+              - Real surrounding lines read directly from the source file (not just diff)
+
+              Use the full context to understand the code before commenting.
+
+              Review each ADDED LINE and comment ONLY if there is a genuine issue:
+              - Bugs or logic errors
+              - Security vulnerabilities  
+              - Performance problems
+              - Bad practices or code smells
+              - Missing error handling
+              - Null / None pointer risks visible from context
+
+              STRICT RULES:
+              - Use context to judge correctly — do NOT flag things that are fine in context
+              - Only comment on the ADDED LINE itself, not context lines
+              - Skip lines that are perfectly fine
+              - Return ONLY a valid JSON array, no explanation, no markdown
+              - Format exactly like this:
+              [
+                {{
+                  "file": "src/example.py",
+                  "line": 12,
+                  "comment": "Your specific actionable comment here"
+                }}
+              ]
+
+              If no issues found return empty array: []
+
+              Lines to review:
+              {diff_text}
+              """
+
+              payload = {
+                  "model": "gpt-4o",
+                  "messages": [
+                      {
+                          "role": "system",
+                          "content": "You are a senior code reviewer. Always respond with valid JSON only. No markdown, no explanation."
+                      },
+                      {"role": "user", "content": prompt}
+                  ],
+                  "max_tokens": 1500,
+                  "temperature": 0.2
+              }
+
+              # Retry logic — 3 attempts with exponential backoff
+              for attempt in range(3):
+                  try:
+                      req = urllib.request.Request(
+                          "https://api.openai.com/v1/chat/completions",
+                          data=json.dumps(payload).encode(),
+                          headers={
+                              "Content-Type": "application/json",
+                              "Authorization": f"Bearer {api_key}"
+                          }
+                      )
+
+                      with urllib.request.urlopen(req) as response:
+                          data = json.loads(response.read())
+
+                      raw = data["choices"][0]["message"]["content"].strip()
+
+                      if raw.startswith("```"):
+                          raw = "\n".join(raw.split("\n")[1:])
+                      if raw.endswith("```"):
+                          raw = "\n".join(raw.split("\n")[:-1])
+
+                      chunk_comments = json.loads(raw)
+                      all_comments.extend(chunk_comments)
+                      print(f"✅ Chunk {idx+1}: {len(chunk_comments)} comments generated")
+                      break   # success — exit retry loop
+
+                  except Exception as e:
+                      print(f"⚠️ Chunk {idx+1} attempt {attempt+1} failed: {e}")
+                      if attempt < 2:
+                          wait = 2 ** attempt   # 1s, 2s, 4s
+                          print(f"Retrying in {wait}s...")
+                          time.sleep(wait)
+                      else:
+                          print(f"❌ Chunk {idx+1} failed after 3 attempts, skipping")
+
+              # Delay between chunks to avoid rate limiting
+              if idx < len(chunks) - 1:
+                  time.sleep(2)
+
+          with open("line_comments.json", "w") as f:
+              json.dump(all_comments, f, indent=2)
+
+          print(f"\n🎯 Total comments from all chunks: {len(all_comments)}")
+          EOF
+
+      # Step 8: Post inline line-level comments on PR
+      - name: Post line-level comments on PR
+        if: steps.check_reviewed.outputs.already_reviewed == 'false' && steps.validate_diff.outputs.too_large == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          PR_COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 << 'EOF'
+          import json
+          import urllib.request
+          import urllib.error
+          import os
+
+          with open("line_comments.json", "r") as f:
+              comments = json.load(f)
+
+          token = os.environ["GITHUB_TOKEN"]
+          repo = os.environ["REPO"]
+          pr_number = os.environ["PR_NUMBER"]
+          commit_sha = os.environ["PR_COMMIT_SHA"]
+
+          posted = 0
+          failed = 0
+
+          for item in comments:
+              payload = {
+                  "body": f"🤖 **AI Review:** {item['comment']}",
+                  "commit_id": commit_sha,
+                  "path": item["file"],
+                  "line": item["line"],
+                  "side": "RIGHT"
+              }
+
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{repo}/pulls/{pr_number}/comments",
+                  data=json.dumps(payload).encode(),
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Content-Type": "application/json",
+                      "Accept": "application/vnd.github.v3+json"
+                  }
+              )
+
+              try:
+                  with urllib.request.urlopen(req) as response:
+                      if response.status == 201:
+                          posted += 1
+                          print(f"✅ Posted on {item['file']} line {item['line']}")
+              except urllib.error.HTTPError as e:
+                  failed += 1
+                  print(f"❌ Failed on {item['file']} line {item['line']}: {e.read().decode()}")
+
+          print(f"\nSummary: {posted} posted, {failed} failed")
+          EOF
+
+      # Step 9: Add ai-reviewed label
+      - name: Add ai-reviewed label
+        if: steps.check_reviewed.outputs.already_reviewed == 'false' && steps.validate_diff.outputs.too_large == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/$REPO/labels" \
+            -d '{"name":"ai-reviewed","color":"7057ff","description":"AI code review completed"}' || true
+
+          curl -s -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/labels" \
+            -d '{"labels":["ai-reviewed"]}'
+
+          echo "✅ Label ai-reviewed applied"
+
+      # Step 10: Post final summary comment
+      - name: Post summary comment
+        if: steps.check_reviewed.outputs.already_reviewed == 'false' && steps.validate_diff.outputs.too_large == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          COMMENT_COUNT=$(python3 -c "import json; d=json.load(open('line_comments.json')); print(len(d))")
+          CHUNK_COUNT=$(python3 -c "import json; d=json.load(open('diff_chunks.json')); print(len(d))")
+
+          curl -s -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments" \
+            -d "{
+              \"body\": \"## ✅ AI Code Review Complete\n\n- **Total added lines reviewed:** ${{ steps.validate_diff.outputs.total_lines }}\n- **Chunks processed:** $CHUNK_COUNT\n- **Inline comments posted:** $COMMENT_COUNT\n- **Label added:** \`ai-reviewed\`\n\n⚠️ **AI review is a one-time pass. Please fix the inline comments above, then request a peer review from your teammates. AI will not review this PR again.**\"
+            }"
