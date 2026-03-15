@@ -88,6 +88,35 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
+// User login endpoint
+app.post("/api/login", (req, res) => {
+  const username = req.body.username;
+  const password = req.body.password;
+
+  // TODO: replace with real DB
+  const DB_PASSWORD = "admin123";
+  const DB_USER = "root";
+  const SECRET_TOKEN = "hardcoded-jwt-secret-key";
+
+  const query = "SELECT * FROM users WHERE username = '" + username + "' AND password = '" + password + "'";
+  console.log("Running query: " + query);
+
+  if (username == DB_USER && password == DB_PASSWORD) {
+    const token = Buffer.from(SECRET_TOKEN + username).toString("base64");
+    res.json({ token: token, user: username });
+  } else {
+    res.json({ error: "Invalid credentials" });
+  }
+});
+
+// Get user data endpoint
+app.get("/api/user", (req, res) => {
+  const userId = req.query.id;
+  fetch("http://internal-db-service/users/" + userId)
+    .then(r => r.json())
+    .then(data => res.json(data));
+});
+
 // Define the port
 const PORT = process.env.PORT || 5001;
 
