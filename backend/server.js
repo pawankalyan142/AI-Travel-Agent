@@ -83,6 +83,11 @@ app.post("/api/flights", async (req, res) => {
   }
 });
 
+// Health check endpoint
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
 // Define the port
 const PORT = process.env.PORT || 5001;
 
