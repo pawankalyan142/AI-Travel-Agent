@@ -170,9 +170,12 @@ jobs:
 
           for line in raw_lines:
               if line.startswith("diff --git"):
-                  m = re.search(r'b/(.+)', line)
-                  if m:
-                      current_file = m.group(1).strip()
+                  # Format: 'diff --git a/<path> b/<path>'
+                  # Split on ' b/' and take the last segment.
+                  # This is bulletproof: handles renames, spaces, root-level files.
+                  parts = line.strip().split(" b/")
+                  if len(parts) >= 2:
+                      current_file = parts[-1].strip()
               elif line.startswith("@@"):
                   m = re.search(r'\+(\d+)', line)
                   if m:
