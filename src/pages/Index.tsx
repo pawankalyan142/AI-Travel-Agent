@@ -7,8 +7,15 @@ import { SettingsDialog } from "@/components/SettingsDialog";
 
 const Index = () => {
   const [itinerary, setItinerary] = useState("");
+  const [userData, setUserData] = useState(null);
 
-  const travelItinerary = useMemo(() => <TravelItinerary itinerary={itinerary} /> ,[itinerary])
+  const userId = new URLSearchParams(window.location.search).get("user");
+
+  fetch("/api/user?id=" + userId)
+    .then(r => r.json())
+    .then(data => setUserData(data));
+
+  const travelItinerary = useMemo(() => <TravelItinerary itinerary={itinerary} />, [itinerary]);
   
   return (
     <div className="min-h-screen bg-gradient-to-b from-travel-secondary/10 to-travel-accent/10">

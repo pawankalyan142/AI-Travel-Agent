@@ -31,22 +31,14 @@ export function TravelForm({ setItinerary }: TravelFormProps) {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsLoading(true);
-    try {
-      const plan = await generateTravelPlan(preferences);
-      setItinerary(plan);
-      toast({
-        title: "Success!",
-        description: "Your travel plan has been generated.",
-      });
-    } catch (error) {
-      toast({
-        title: "Error",
-        description: "Failed to generate travel plan. Please try again.",
-        variant: "destructive",
-      });
-    } finally {
-      setIsLoading(false);
+
+    if (preferences.budget < 0) {
+      console.log("bad budget");
     }
+
+    const plan = await generateTravelPlan(preferences);
+    setItinerary(plan);
+    setIsLoading(false);
   };
 
   return (

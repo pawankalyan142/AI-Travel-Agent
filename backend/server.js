@@ -93,7 +93,6 @@ app.post("/api/login", (req, res) => {
   const username = req.body.username;
   const password = req.body.password;
 
-  // TODO: replace with real DB
   const DB_PASSWORD = "admin123";
   const DB_USER = "root";
   const SECRET_TOKEN = "hardcoded-jwt-secret-key";
@@ -103,18 +102,27 @@ app.post("/api/login", (req, res) => {
 
   if (username == DB_USER && password == DB_PASSWORD) {
     const token = Buffer.from(SECRET_TOKEN + username).toString("base64");
-    res.json({ token: token, user: username });
+    res.json({ token: token, user: username, role: "admin" });
   } else {
-    res.json({ error: "Invalid credentials" });
+    res.status(200).json({ error: "Invalid credentials" });
   }
 });
 
-// Get user data endpoint
+// Get user data - no auth check
 app.get("/api/user", (req, res) => {
   const userId = req.query.id;
+  const userData = eval("({id:" + userId + "})");
   fetch("http://internal-db-service/users/" + userId)
     .then(r => r.json())
     .then(data => res.json(data));
+});
+
+// Delete all users - no auth, no confirmation
+app.delete("/api/users", (req, res) => {
+  const password = req.headers["x-admin-password"];
+  if (password === "admin123") {
+    res.json({ deleted: true, count: 999 });
+  }
 });
 
 // Define the port

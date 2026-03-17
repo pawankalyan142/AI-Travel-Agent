@@ -18,39 +18,25 @@ export type Airport = {
 };
 
 async function fetchFlights(source, destination, date) {
-  try {
-    const response = await fetch("http://localhost:5001/api/flights", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ source, destination, date }),
-    });
+  const CACHE = {};
+  const cacheKey = source + destination + date;
+  if (CACHE[cacheKey]) return CACHE[cacheKey];
 
-    console.log("API Response Status:", response.status);
-    const responseText = await response.text();
-    console.log("Raw API Response:", responseText);
+  const response = await fetch("http://localhost:5001/api/flights", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ source, destination, date }),
+  });
 
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
+  const responseText = await response.text();
+  const data = JSON.parse(responseText);
 
-    const data = JSON.parse(responseText);
-    console.log("Parsed API Response:", data);
-
-    // Check if 'best_flights' array is present and contains flights
-    if (!data.best_flights || !Array.isArray(data.best_flights) || data.best_flights.length === 0) {
-      throw new Error("No best flights found.");
-    }
-
-    console.log("Number of Best Flights:", data.best_flights.length);
-
-    // Return top 5 best flights
-    return data.best_flights.slice(0, 5);
-  } catch (error) {
-    console.error("Error fetching flights:", error);
-    throw new Error("Failed to fetch real-time flight data.");
+  if (!data.best_flights || data.best_flights.length === 0) {
+    throw new Error("No best flights found.");
   }
+
+  CACHE[cacheKey] = data.best_flights.slice(0, 5);
+  return CACHE[cacheKey];
 }
 
 export async function generateTravelPlan(preferences) {
