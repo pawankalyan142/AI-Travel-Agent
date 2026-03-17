@@ -71,7 +71,7 @@ jobs:
             -H "Content-Type: application/json" \
             "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments" \
             -d "{
-              \"body\": \"## \u2139\ufe0f AI Review Already Done\n\n\u2705 AI has already reviewed this PR once. No further AI reviews will run.\n\n**Next step:** Please fix the AI comments and request a **peer review** from your teammates.\"
+              \"body\": \"## ℹ️ AI Review Already Done\n\n✅ AI has already reviewed this PR once. No further AI reviews will run.\n\n**Next step:** Please fix the AI comments and request a **peer review** from your teammates.\"
             }"
 
       # Step 4: Get diff — only source files, count only added lines
@@ -108,7 +108,7 @@ jobs:
             -H "Content-Type: application/json" \
             "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments" \
             -d "{
-              \"body\": \"## \u26a0\ufe0f AI Code Review Skipped\n\n**Reason:** This PR has **${{ steps.validate_diff.outputs.total_lines }} added lines** which exceeds the maximum limit of 1000 lines.\n\n**Please split this PR into smaller focused PRs.**\"
+              \"body\": \"## ⚠️ AI Code Review Skipped\n\n**Reason:** This PR has **${{ steps.validate_diff.outputs.total_lines }} added lines** which exceeds the maximum limit of 1000 lines.\n\n**Please split this PR into smaller focused PRs.**\"
             }"
           exit 0
 
@@ -155,19 +155,16 @@ jobs:
               changed_line_num = entry["line"]
               context_before = []
               context_after = []
-              # Read directly from the actual file sitting on runner machine
               if os.path.exists(file_path):
                   with open(file_path, "r", errors="ignore") as f:
                       all_file_lines = f.readlines()
                   total_file_lines = len(all_file_lines)
-                  # Read N lines before the changed line
                   start = max(0, changed_line_num - context_size - 1)
                   end = changed_line_num - 1
                   context_before = [
                       f"line {start + i + 1}: {all_file_lines[start + i].rstrip()}"
                       for i in range(end - start)
                   ]
-                  # Read N lines after the changed line
                   start_after = changed_line_num
                   end_after = min(total_file_lines, changed_line_num + context_size)
                   context_after = [
@@ -210,13 +207,15 @@ jobs:
           all_comments = []
 
           for idx, chunk in enumerate(chunks):
-              print(f"\n Processing chunk {idx+1}/{len(chunks)} ({len(chunk)} lines)...")
+              print(f"\nProcessing chunk {idx+1}/{len(chunks)} ({len(chunk)} lines)...")
 
-              # Build rich prompt input with real file context for each line
+              # Build prompt input — each entry labelled with EXACT file path and line number
               diff_text = ""
               for item in chunk:
                   diff_text += "\n---\n"
-                  diff_text += f"File: {item['file']} | Line: {item['line']}\n"
+                  # FILE_PATH is written alone on its own token so the model copies it cleanly
+                  diff_text += f"FILE_PATH: {item['file']}\n"
+                  diff_text += f"LINE: {item['line']}\n"
                   if item["context_before"]:
                       diff_text += "Context before:\n"
                       for c in item["context_before"]:
@@ -228,7 +227,7 @@ jobs:
                           diff_text += f"  {c}\n"
 
               # ---------------------------------------------------------------
-              # SYSTEM PROMPT — role + hard output contract
+              # SYSTEM PROMPT
               # ---------------------------------------------------------------
               system_prompt = (
                   "You are a senior software engineer performing a focused, high-signal code review. "
@@ -238,54 +237,52 @@ jobs:
               )
 
               # ---------------------------------------------------------------
-              # USER PROMPT — what to review and how to reason about it
+              # USER PROMPT
               # ---------------------------------------------------------------
               user_prompt = (
-                  "You will review newly added lines from a pull request.\n"
-                  "Each entry shows the added line (marked with >>>) plus real surrounding lines from the source file for context.\n"
+                  "Review the newly added lines from a pull request below.\n"
+                  "Each block shows:\n"
+                  "  FILE_PATH — the exact file path you MUST copy into your JSON output\n"
+                  "  LINE      — the exact line number you MUST copy into your JSON output\n"
+                  "  Context before/after — surrounding lines from the real file (for understanding only)\n"
+                  "  >>> ADDED LINE — the line you must review\n"
                   "\n"
-                  "YOUR TASK:\n"
-                  "Flag the ADDED LINE only if it has a genuine, objective issue in one of these categories:\n"
-                  "\n"
-                  "SEVERITY LEVELS:\n"
-                  "- CRITICAL : Security vulnerabilities (injection, exposed secrets, broken auth, insecure deserialization)\n"
-                  "- CRITICAL : Bugs that will cause crashes, data loss, or wrong results (null dereference, wrong operator, off-by-one with real impact)\n"
-                  "- HIGH     : Missing error handling on I/O, network, or DB calls that will silently fail in production\n"
-                  "- HIGH     : Race conditions or concurrency bugs\n"
-                  "- MEDIUM   : Obvious performance issues (N+1 queries, large-data loops, missing pagination)\n"
-                  "- MEDIUM   : Resource leaks (unclosed files, connections, handles)\n"
-                  "- LOW      : Hardcoded secrets, URLs, or magic numbers that should be config\n"
+                  "FLAG the ADDED LINE only if it has a genuine, objective issue:\n"
+                  "  - Security vulnerabilities (injection, exposed secrets, broken auth)\n"
+                  "  - Bugs that will cause crashes, data loss, or wrong results\n"
+                  "  - Missing error handling on I/O, network, or DB calls that will silently fail\n"
+                  "  - Race conditions or concurrency bugs\n"
+                  "  - Obvious performance issues (N+1 queries, unbounded loops on large data)\n"
+                  "  - Resource leaks (unclosed files, connections, handles)\n"
+                  "  - Hardcoded secrets, credentials, or magic values that must be config\n"
                   "\n"
                   "DO NOT FLAG:\n"
-                  "- Style, naming, or formatting preferences\n"
-                  "- Architectural opinions ('you should restructure this')\n"
-                  "- Anything already clearly handled in the surrounding context lines\n"
-                  "- Lines that look unusual but are correct given context\n"
-                  "- Test files unless there is a definite logic bug\n"
+                  "  - Style, naming, or formatting preferences\n"
+                  "  - Architectural opinions\n"
+                  "  - Anything already handled in the surrounding context lines\n"
+                  "  - Test files unless there is a definite logic bug\n"
                   "\n"
-                  "THINKING STEPS (do this mentally before outputting):\n"
-                  "1. Read the full context block to understand what the code does\n"
-                  "2. Focus only on the >>> ADDED LINE\n"
-                  "3. Ask: 'Will this line cause a real problem in production?' — if yes, flag it\n"
-                  "4. Ask: 'Is the fix specific and actionable?' — if not, skip it\n"
+                  "BEFORE outputting, think through:\n"
+                  "  1. Read the full context to understand what the code does\n"
+                  "  2. Focus only on the >>> ADDED LINE\n"
+                  "  3. Will this line cause a real problem in production?\n"
+                  "  4. Is the fix specific and actionable?\n"
                   "\n"
-                  "OUTPUT FORMAT — return a JSON array, each object with exactly these fields:\n"
-                  '- "file"     : copy EXACTLY from the "File:" label above the block — no b/ prefix, no shortening\n'
-                  '- "line"     : integer line number shown after "File:"\n'
-                  '- "severity" : one of "CRITICAL", "HIGH", "MEDIUM", "LOW"\n'
-                  '- "comment"  : one concise sentence — state the problem and what to do instead\n'
+                  "OUTPUT — a JSON array where each object has exactly:\n"
+                  '  "file"    : copy the FILE_PATH value exactly, character-for-character\n'
+                  '  "line"    : copy the LINE value exactly as an integer\n'
+                  '  "comment" : one concise sentence — state the problem and what to fix\n'
                   "\n"
-                  "Example output:\n"
+                  "Example:\n"
                   "[\n"
                   "  {\n"
                   '    "file": "src/lib/gemini.ts",\n'
                   '    "line": 34,\n'
-                  '    "severity": "HIGH",\n'
-                  '    "comment": "API key is accessed without a null check — if the env variable is missing this will throw at runtime; add a startup guard and throw a descriptive error early."\n'
+                  '    "comment": "API key is read without a null check — add a startup guard and throw a descriptive error if the variable is missing."\n'
                   "  }\n"
                   "]\n"
                   "\n"
-                  "If no genuine issues exist, return exactly: []\n"
+                  "If no genuine issues, return exactly: []\n"
                   "\n"
                   "LINES TO REVIEW:\n"
                   + diff_text
@@ -301,7 +298,6 @@ jobs:
                   "temperature": 0.1
               }
 
-              # Retry logic — 3 attempts with exponential backoff
               for attempt in range(3):
                   try:
                       req = urllib.request.Request(
@@ -316,7 +312,6 @@ jobs:
                           data = json.loads(response.read())
 
                       raw = data["choices"][0]["message"]["content"].strip()
-                      # Strip accidental markdown fences
                       if raw.startswith("```"):
                           raw = "\n".join(raw.split("\n")[1:])
                       if raw.endswith("```"):
@@ -326,7 +321,7 @@ jobs:
                       chunk_comments = json.loads(raw)
                       all_comments.extend(chunk_comments)
                       print(f"Chunk {idx+1}: {len(chunk_comments)} comments generated")
-                      break   # success — exit retry loop
+                      break
 
                   except Exception as e:
                       print(f"Chunk {idx+1} attempt {attempt+1} failed: {e}")
@@ -337,7 +332,6 @@ jobs:
                       else:
                           print(f"Chunk {idx+1} failed after 3 attempts, skipping")
 
-              # Delay between chunks to avoid rate limiting
               if idx < len(chunks) - 1:
                   time.sleep(2)
 
@@ -367,8 +361,8 @@ jobs:
           with open("diff_chunks.json", "r") as f:
               chunks = json.load(f)
 
-          # Build a lookup: basename -> full path, from actual parsed diff data
-          # This corrects any path mangling the AI may have done (b/ prefix, bare filename, etc.)
+          # Build authoritative path lookup from the parsed diff — these paths are always correct
+          # Keys: full path, basename, and any b/-prefixed variant all map to the clean full path
           path_lookup = {}
           for chunk in chunks:
               for item in chunk:
@@ -376,25 +370,44 @@ jobs:
                   if full_path.startswith("b/"):
                       full_path = full_path[2:]
                   path_lookup[full_path] = full_path
-                  basename = full_path.split("/")[-1]
-                  if basename not in path_lookup:
-                      path_lookup[basename] = full_path
+                  # Strip leading directories progressively so partial paths also resolve
+                  parts = full_path.split("/")
+                  for i in range(len(parts)):
+                      suffix = "/".join(parts[i:])
+                      if suffix not in path_lookup:
+                          path_lookup[suffix] = full_path
 
-          def resolve_path(raw_path):
-              p = raw_path.strip()
-              if p.startswith("b/"):
-                  p = p[2:]
-              if p in path_lookup:
-                  return path_lookup[p]
-              basename = p.split("/")[-1]
-              return path_lookup.get(basename, p)
+          def resolve_path(raw):
+              """
+              Clean up whatever the AI returned and map it to the real file path.
+              Handles: 'src/lib/gemini.ts', 'gemini.ts', 'b/src/lib/gemini.ts',
+                       'gemini.ts b/src/lib/gemini.ts' (AI copied whole label line)
+              """
+              raw = raw.strip()
 
-          severity_badge = {
-              "CRITICAL": "\U0001f534 CRITICAL",
-              "HIGH":     "\U0001f7e0 HIGH",
-              "MEDIUM":   "\U0001f7e1 MEDIUM",
-              "LOW":      "\U0001f535 LOW",
-          }
+              # Case: AI copied the whole label e.g. "gemini.ts b/src/lib/gemini.ts"
+              # Take the last token which is the most specific path
+              if " " in raw:
+                  raw = raw.split()[-1]
+
+              # Strip b/ prefix
+              if raw.startswith("b/"):
+                  raw = raw[2:]
+
+              # Exact match
+              if raw in path_lookup:
+                  return path_lookup[raw]
+
+              # Suffix match (e.g. bare filename or partial path)
+              parts = raw.split("/")
+              for i in range(len(parts)):
+                  suffix = "/".join(parts[i:])
+                  if suffix in path_lookup:
+                      return path_lookup[suffix]
+
+              # No match — return as-is and let GitHub give the 422
+              print(f"  WARNING: could not resolve path '{raw}' — posting as-is")
+              return raw
 
           token = os.environ["GITHUB_TOKEN"]
           repo = os.environ["REPO"]
@@ -406,10 +419,8 @@ jobs:
 
           for item in comments:
               resolved_path = resolve_path(item["file"])
-              sev = item.get("severity", "LOW").upper()
-              badge = severity_badge.get(sev, "\U0001f535 LOW")
               payload = {
-                  "body": f"\U0001f916 **AI Review [{badge}]:** {item['comment']}",
+                  "body": f"🤖 **AI Review:** {item['comment']}",
                   "commit_id": commit_sha,
                   "path": resolved_path,
                   "line": item["line"],
@@ -428,7 +439,7 @@ jobs:
                   with urllib.request.urlopen(req) as response:
                       if response.status == 201:
                           posted += 1
-                          print(f"Posted [{sev}] on {resolved_path} line {item['line']}")
+                          print(f"Posted on {resolved_path} line {item['line']}")
               except urllib.error.HTTPError as e:
                   failed += 1
                   print(f"Failed on {resolved_path} line {item['line']}: {e.read().decode()}")
@@ -456,7 +467,7 @@ jobs:
             -d '{"labels":["ai-reviewed"]}'
           echo "Label ai-reviewed applied"
 
-      # Step 10: Post final summary comment with severity breakdown
+      # Step 10: Post final summary comment
       - name: Post summary comment
         if: steps.check_reviewed.outputs.already_reviewed == 'false' && steps.validate_diff.outputs.too_large == 'false'
         env:
@@ -473,29 +484,16 @@ jobs:
           with open("diff_chunks.json") as f:
               chunks = json.load(f)
 
+          total_lines = os.environ.get("TOTAL_LINES", "?")
           chunk_count = len(chunks)
           total = len(comments)
-          counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
-          for c in comments:
-              sev = c.get("severity", "LOW").upper()
-              if sev in counts:
-                  counts[sev] += 1
 
-          breakdown = ""
-          if counts["CRITICAL"]: breakdown += f"  - \U0001f534 **CRITICAL:** {counts['CRITICAL']}\n"
-          if counts["HIGH"]:     breakdown += f"  - \U0001f7e0 **HIGH:** {counts['HIGH']}\n"
-          if counts["MEDIUM"]:   breakdown += f"  - \U0001f7e1 **MEDIUM:** {counts['MEDIUM']}\n"
-          if counts["LOW"]:      breakdown += f"  - \U0001f535 **LOW:** {counts['LOW']}\n"
-          if not breakdown:      breakdown  = "  - \u2705 No issues found\n"
-
-          total_lines = os.environ.get("TOTAL_LINES", "?")
           body = (
               "## \u2705 AI Code Review Complete\n\n"
               f"- **Total added lines reviewed:** {total_lines}\n"
               f"- **Chunks processed:** {chunk_count}\n"
               f"- **Inline comments posted:** {total}\n"
               "- **Label added:** `ai-reviewed`\n\n"
-              f"**Severity breakdown:**\n{breakdown}\n"
               "\u26a0\ufe0f **AI review is a one-time pass. Please fix the inline comments above, "
               "then request a peer review from your teammates. AI will not review this PR again.**"
           )
