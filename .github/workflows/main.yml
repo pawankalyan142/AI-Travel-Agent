@@ -5,9 +5,9 @@ on:
     types: [opened, synchronize, reopened]
 
 env:
-  CHUNK_SIZE: 200
-  MAX_TOTAL_LINES: 1000
-  CONTEXT_LINES: 5
+  MAX_TOTAL_LINES: 1000   # PR-level hard limit
+  MAX_LINES_PER_FILE: 300  # Safety split threshold per file
+  CONTEXT_LINES: 10        # Increased — more context per file is now valuable
 
 permissions:
   pull-requests: write
@@ -67,7 +67,7 @@ jobs:
             "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments" \
             -d "{\"body\": \"## \u2139\ufe0f AI Review Already Done\n\n\u2705 AI has already reviewed this PR once. No further AI reviews will run.\n\n**Next step:** Please fix the AI comments and request a **peer review** from your teammates.\"}"
 
-      # Step 4: Get local diff for line content + size check
+      # Step 4: Get local diff for content + size check
       - name: Get PR diff and validate size
         if: steps.check_reviewed.outputs.already_reviewed == 'false'
         id: validate_diff
@@ -103,20 +103,26 @@ jobs:
             -d "{\"body\": \"## \u26a0\ufe0f AI Code Review Skipped\n\n**Reason:** This PR has **${{ steps.validate_diff.outputs.total_lines }} added lines** which exceeds the limit of 1000 lines.\n\n**Please split this PR into smaller focused PRs.**\"}"
           exit 0
 
-      # Step 6: Build valid line set from GitHub's PR Files API + prepare chunks
+      # Step 6: Build valid lines from GitHub API + FILE-LEVEL chunks
       #
-      # We ask GitHub directly which lines exist in its diff view via
-      # GET /pulls/{pr}/files — this is exactly what GitHub's comment API
-      # validates against. Using our local git diff for this would risk
-      # divergence (merge commits, branch staleness, hunk boundary differences).
-      # Local diff is still used for code content and context lines only.
-      - name: Build valid lines from GitHub API and prepare chunks
+      # CHUNKING STRATEGY: one chunk = one complete file's changes.
+      # The AI sees ALL changes in a file together, with full context per line,
+      # the filename, language, and total file size. This gives the AI the same
+      # view a senior developer has when reviewing a file.
+      #
+      # Safety split: if a single file has >MAX_LINES_PER_FILE added lines,
+      # split it into parts at blank lines to avoid token limit issues.
+      #
+      # ID system: every added line still gets a numeric ID so the AI never
+      # needs to reference file paths — zero hallucination risk.
+      - name: Build valid lines from GitHub API and prepare file-level chunks
         if: steps.check_reviewed.outputs.already_reviewed == 'false' && steps.validate_diff.outputs.too_large == 'false'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           CONTEXT_LINES: ${{ env.CONTEXT_LINES }}
+          MAX_LINES_PER_FILE: ${{ env.MAX_LINES_PER_FILE }}
         run: |
           python3 << 'EOF'
           import urllib.request, json, re, os
@@ -124,9 +130,13 @@ jobs:
           token = os.environ["GITHUB_TOKEN"]
           repo = os.environ["REPO"]
           pr_number = os.environ["PR_NUMBER"]
-          context_size = int(os.environ.get("CONTEXT_LINES", 5))
+          context_size = int(os.environ.get("CONTEXT_LINES", 10))
+          max_per_file = int(os.environ.get("MAX_LINES_PER_FILE", 300))
 
-          # --- PART A: fetch valid (file, line) set from GitHub's own PR Files API ---
+          # ----------------------------------------------------------------
+          # PART A: Get valid (file, line) set from GitHub's PR Files API
+          # This is the ground truth for what GitHub's comment API accepts.
+          # ----------------------------------------------------------------
           valid = set()
           page = 1
           while True:
@@ -160,8 +170,29 @@ jobs:
           with open("valid_lines.json", "w") as out:
               json.dump([{"file": f, "line": l} for f, l in valid], out)
 
-          # --- PART B: parse local diff for code content + context ---
-          changed_lines = []
+          # ----------------------------------------------------------------
+          # PART B: Parse local diff — group changes BY FILE
+          # Each file gets its own list of added lines with full context.
+          # This is the core of the file-level chunking strategy.
+          # ----------------------------------------------------------------
+
+          # Language detection from extension — tells AI what it's reviewing
+          LANG_MAP = {
+              "js": "JavaScript", "ts": "TypeScript", "tsx": "TypeScript/React",
+              "jsx": "JavaScript/React", "py": "Python", "java": "Java",
+              "go": "Go", "rb": "Ruby", "php": "PHP", "cs": "C#",
+              "cpp": "C++", "c": "C", "h": "C/C++ Header", "rs": "Rust",
+              "swift": "Swift", "kt": "Kotlin", "scala": "Scala",
+              "yaml": "YAML", "yml": "YAML", "json": "JSON",
+              "html": "HTML", "css": "CSS", "scss": "SCSS"
+          }
+
+          def get_language(filepath):
+              ext = filepath.rsplit(".", 1)[-1].lower() if "." in filepath else ""
+              return LANG_MAP.get(ext, "Unknown")
+
+          # files_data: { filepath: [{"line": N, "content": "..."}, ...] }
+          files_data = {}
           current_file = None
           new_line = 0
 
@@ -170,56 +201,126 @@ jobs:
 
           for line in raw_lines:
               if line.startswith("diff --git"):
-                  # Format: 'diff --git a/<path> b/<path>'
-                  # Split on ' b/' and take the last segment.
-                  # This is bulletproof: handles renames, spaces, root-level files.
                   parts = line.strip().split(" b/")
                   if len(parts) >= 2:
                       current_file = parts[-1].strip()
+                      if current_file not in files_data:
+                          files_data[current_file] = []
+                  new_line = 0
               elif line.startswith("@@"):
                   m = re.search(r'\+(\d+)', line)
                   if m:
                       new_line = int(m.group(1)) - 1
               elif line.startswith("+") and not line.startswith("+++"):
                   new_line += 1
-                  changed_lines.append({"file": current_file, "line": new_line, "content": line[1:].rstrip()})
+                  if current_file:
+                      files_data[current_file].append({
+                          "line": new_line,
+                          "content": line[1:].rstrip()
+                      })
               elif not line.startswith("-") and not line.startswith("\\"):
                   new_line += 1
 
-          diff_data = []
-          for entry in changed_lines:
-              fp = entry["file"]
-              n = entry["line"]
-              ctx_before, ctx_after = [], []
-              if os.path.exists(fp):
-                  with open(fp, "r", errors="ignore") as f:
-                      all_lines = f.readlines()
-                  total = len(all_lines)
-                  start = max(0, n - context_size - 1)
-                  ctx_before = [
-                      f"line {start+i+1}: {all_lines[start+i].rstrip()}"
-                      for i in range(n - 1 - start)
-                  ]
-                  start_after = n
-                  end_after = min(total, n + context_size)
-                  ctx_after = [
-                      f"line {start_after+i+1}: {all_lines[start_after+i].rstrip()}"
-                      for i in range(end_after - start_after)
-                  ]
-              diff_data.append({
-                  "file": fp, "line": n, "content": entry["content"],
-                  "context_before": ctx_before, "context_after": ctx_after
-              })
+          # ----------------------------------------------------------------
+          # PART C: Build enriched chunks — one per file (with safety split)
+          # Each line gets:
+          #   - context_before: N real lines from the actual file before it
+          #   - context_after:  N real lines from the actual file after it
+          #   - a numeric ID (AI uses this, never the file path)
+          # ----------------------------------------------------------------
+          chunks = []
+          global_id_counter = 0
 
-          chunk_size = int(os.environ.get("CHUNK_SIZE", 200))
-          chunks = [diff_data[i:i+chunk_size] for i in range(0, len(diff_data), chunk_size)]
+          for filepath, added_lines in files_data.items():
+              if not added_lines:
+                  continue
+
+              # Read the full file for context
+              all_file_lines = []
+              if os.path.exists(filepath):
+                  with open(filepath, "r", errors="ignore") as f:
+                      all_file_lines = f.readlines()
+              total_file_lines = len(all_file_lines)
+              language = get_language(filepath)
+
+              # Enrich each added line with context and assign ID
+              enriched = []
+              for entry in added_lines:
+                  n = entry["line"]
+                  lid = global_id_counter
+                  global_id_counter += 1
+
+                  ctx_before, ctx_after = [], []
+                  if all_file_lines:
+                      start = max(0, n - context_size - 1)
+                      ctx_before = [
+                          f"line {start+i+1}: {all_file_lines[start+i].rstrip()}"
+                          for i in range(n - 1 - start)
+                      ]
+                      start_after = n
+                      end_after = min(total_file_lines, n + context_size)
+                      ctx_after = [
+                          f"line {start_after+i+1}: {all_file_lines[start_after+i].rstrip()}"
+                          for i in range(end_after - start_after)
+                      ]
+
+                  enriched.append({
+                      "id":             lid,
+                      "line":           n,
+                      "content":        entry["content"],
+                      "context_before": ctx_before,
+                      "context_after":  ctx_after
+                  })
+
+              # Safety split: if this file has too many added lines,
+              # split into parts at blank lines where possible
+              if len(enriched) <= max_per_file:
+                  parts_list = [enriched]
+              else:
+                  parts_list = []
+                  current_part = []
+                  for item in enriched:
+                      current_part.append(item)
+                      # Split at blank lines when we hit the limit
+                      if len(current_part) >= max_per_file and item["content"].strip() == "":
+                          parts_list.append(current_part)
+                          current_part = []
+                  if current_part:
+                      parts_list.append(current_part)
+
+              for part_idx, part in enumerate(parts_list):
+                  part_label = f" (part {part_idx+1}/{len(parts_list)})" if len(parts_list) > 1 else ""
+                  chunks.append({
+                      "file":             filepath,
+                      "language":         language,
+                      "total_file_lines": total_file_lines,
+                      "part_label":       part_label,
+                      "lines":            part
+                  })
+
           with open("diff_chunks.json", "w") as out:
               json.dump(chunks, out, indent=2)
-          print(f"Total changed lines: {len(diff_data)}, chunks: {len(chunks)}")
+
+          total_added = sum(len(c["lines"]) for c in chunks)
+          print(f"Files to review: {len(files_data)}")
+          print(f"Total chunks (after safety split): {len(chunks)}")
+          print(f"Total added lines: {total_added}")
+          for c in chunks:
+              print(f"  {c['file']}{c['part_label']}: {len(c['lines'])} added lines in {c['total_file_lines']}-line file")
           EOF
 
-      # Step 7: Call OpenAI — AI only sees/returns numeric IDs, never file paths
-      - name: Call OpenAI per chunk and collect comments
+      # Step 7: Call OpenAI — one API call per file chunk
+      #
+      # The prompt now tells the AI:
+      #   - exactly which file it is reviewing
+      #   - the language
+      #   - total size of the file
+      #   - ALL changes in that file together
+      #
+      # This gives the AI the same mental model a senior developer has:
+      # reviewing one complete file at a time, understanding the full scope
+      # of what changed and how the changes relate to each other.
+      - name: Call OpenAI per file chunk and collect comments
         if: steps.check_reviewed.outputs.already_reviewed == 'false' && steps.validate_diff.outputs.too_large == 'false'
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -232,66 +333,92 @@ jobs:
 
           api_key = os.environ["OPENAI_API_KEY"]
           all_comments = []
-          global_id_counter = 0
+
+          # Rebuild id_map from chunks so we can resolve AI IDs back to file+line
+          id_map = {}
+          for chunk in chunks:
+              for item in chunk["lines"]:
+                  id_map[item["id"]] = {"file": chunk["file"], "line": item["line"]}
 
           for idx, chunk in enumerate(chunks):
-              print(f"\nProcessing chunk {idx+1}/{len(chunks)} ({len(chunk)} lines)...")
+              filepath   = chunk["file"]
+              language   = chunk["language"]
+              total_lines = chunk["total_file_lines"]
+              part_label  = chunk["part_label"]
+              added_lines = chunk["lines"]
 
-              chunk_id_map = {}
+              print(f"\nReviewing: {filepath}{part_label} ({len(added_lines)} changes in {total_lines}-line file)")
+
+              # Build the diff text — full file context per line
               diff_text = ""
-
-              for item in chunk:
-                  lid = global_id_counter
-                  global_id_counter += 1
-                  chunk_id_map[lid] = {"file": item["file"], "line": item["line"]}
-
-                  diff_text += f"\n--- ID:{lid} ---\n"
+              for item in added_lines:
+                  diff_text += f"\n--- ID:{item['id']} (line {item['line']}) ---\n"
                   if item["context_before"]:
                       diff_text += "Context before:\n"
                       for c in item["context_before"]:
                           diff_text += f"  {c}\n"
-                  diff_text += f">>> ADDED LINE (ID:{lid}): {item['content']}\n"
+                  diff_text += f">>> ADDED LINE {item['line']} (ID:{item['id']}): {item['content']}\n"
                   if item["context_after"]:
                       diff_text += "Context after:\n"
                       for c in item["context_after"]:
                           diff_text += f"  {c}\n"
 
               system_prompt = (
-                  "You are a senior software engineer performing a focused, high-signal code review. "
+                  "You are a senior software engineer doing a thorough, file-aware code review. "
+                  "You see ALL changes in a single file at once, just like a real code reviewer would. "
                   "You respond ONLY with a valid JSON array. "
                   "No markdown fences, no explanation, no preamble. "
                   "If there are no issues return exactly: []"
               )
 
               user_prompt = (
-                  "Review the newly added lines from a pull request below.\n"
-                  "Each block is identified by a numeric ID like ID:42.\n"
-                  "Context before/after lines are for understanding only — do NOT flag them.\n"
-                  "Only flag the >>> ADDED LINE if it has a genuine, objective issue.\n"
+                  f"You are reviewing changes to: {filepath}{part_label}\n"
+                  f"Language: {language}\n"
+                  f"File size: {total_lines} lines total\n"
+                  f"Changes in this review: {len(added_lines)} added lines\n"
                   "\n"
-                  "FLAG only for:\n"
-                  "  - Security vulnerabilities (injection, exposed secrets, broken auth)\n"
-                  "  - Bugs causing crashes, data loss, or wrong results\n"
-                  "  - Missing error handling on I/O, network, or DB calls\n"
+                  "You can see ALL the changes made to this file in this PR, along with\n"
+                  "the surrounding context lines from the actual file.\n"
+                  "Use this full picture to understand the intent of the changes and\n"
+                  "how the changed lines relate to each other.\n"
+                  "\n"
+                  "Each changed line is marked with >>> and identified by ID:N.\n"
+                  "Context lines (not marked with >>>) are shown for understanding only.\n"
+                  "\n"
+                  "FLAG a line ONLY if it has a genuine, objective issue:\n"
+                  "  - Security vulnerabilities (injection, exposed secrets, broken auth,\n"
+                  "    insecure deserialization, missing input validation)\n"
+                  "  - Bugs that will cause crashes, data loss, or wrong results\n"
+                  "    (null dereference, wrong operator, off-by-one with real impact)\n"
+                  "  - Missing error handling on I/O, network calls, or DB operations\n"
+                  "    that will silently fail or crash in production\n"
                   "  - Race conditions or concurrency bugs\n"
-                  "  - Obvious performance issues (N+1 queries, unbounded loops)\n"
+                  "  - Obvious performance issues (N+1 queries, unbounded loops on large data)\n"
                   "  - Resource leaks (unclosed files, connections, handles)\n"
-                  "  - Hardcoded secrets or magic values that must be config\n"
+                  "  - Hardcoded secrets, credentials, or environment-specific magic values\n"
+                  "\n"
+                  "SINCE YOU SEE THE FULL FILE CONTEXT:\n"
+                  "  - If multiple changed lines form a pattern (e.g. no error handling\n"
+                  "    across several DB calls), flag the first occurrence and mention\n"
+                  "    the pattern — do NOT repeat the same comment on every line\n"
+                  "  - If a change looks risky in isolation but is safe given the rest\n"
+                  "    of the file context, do NOT flag it\n"
+                  "  - Consider how changed lines interact with each other\n"
                   "\n"
                   "DO NOT FLAG:\n"
-                  "  - Style, naming, or formatting\n"
-                  "  - Architectural opinions\n"
-                  "  - Issues already handled in surrounding context\n"
+                  "  - Style, naming, or formatting preferences\n"
+                  "  - Architectural opinions ('you should restructure this')\n"
+                  "  - Issues clearly handled elsewhere in the visible context\n"
                   "  - Test files unless there is a definite logic bug\n"
                   "\n"
                   "OUTPUT — a JSON array. Each object must have exactly:\n"
-                  '  "id"      : the integer ID number from ID:N (just the number, no prefix)\n'
-                  '  "comment" : one sentence — the problem and what to fix\n'
+                  '  "id"      : the integer from ID:N — just the number\n'
+                  '  "comment" : one clear sentence — the specific problem and exact fix\n'
                   "\n"
                   'Example: [ {"id": 3, "comment": "..."}, {"id": 17, "comment": "..."} ]\n'
-                  "If no issues: []\n"
+                  "If no genuine issues: []\n"
                   "\n"
-                  "LINES TO REVIEW:\n"
+                  "CHANGES TO REVIEW:\n"
                   + diff_text
               )
 
@@ -301,7 +428,7 @@ jobs:
                       {"role": "system", "content": system_prompt},
                       {"role": "user",   "content": user_prompt}
                   ],
-                  "max_tokens": 1500,
+                  "max_tokens": 2000,
                   "temperature": 0.1
               }
 
@@ -322,49 +449,45 @@ jobs:
                           raw = "\n".join(raw.split("\n")[:-1])
                       raw = raw.strip()
 
-                      chunk_comments = json.loads(raw)
+                      file_comments = json.loads(raw)
                       resolved = []
-                      for c in chunk_comments:
+                      for c in file_comments:
                           lid = int(c["id"])
-                          if lid in chunk_id_map:
+                          if lid in id_map:
                               resolved.append({
-                                  "file":    chunk_id_map[lid]["file"],
-                                  "line":    chunk_id_map[lid]["line"],
+                                  "file":    id_map[lid]["file"],
+                                  "line":    id_map[lid]["line"],
                                   "comment": c["comment"]
                               })
                           else:
                               print(f"  WARNING: unknown ID {lid}, skipping")
 
                       all_comments.extend(resolved)
-                      print(f"Chunk {idx+1}: {len(resolved)} comments resolved")
+                      print(f"  -> {len(resolved)} comments")
                       break
 
                   except Exception as e:
-                      print(f"Chunk {idx+1} attempt {attempt+1} failed: {e}")
+                      print(f"  Attempt {attempt+1} failed: {e}")
                       if attempt < 2:
                           wait = 2 ** attempt
-                          print(f"Retrying in {wait}s...")
+                          print(f"  Retrying in {wait}s...")
                           time.sleep(wait)
                       else:
-                          print(f"Chunk {idx+1} failed after 3 attempts, skipping")
+                          print(f"  Failed after 3 attempts, skipping {filepath}")
 
+              # Small delay between files to avoid rate limiting
               if idx < len(chunks) - 1:
-                  time.sleep(2)
+                  time.sleep(1)
 
           with open("line_comments.json", "w") as f:
               json.dump(all_comments, f, indent=2)
-          print(f"\nTotal comments: {len(all_comments)}")
+          print(f"\nTotal comments across all files: {len(all_comments)}")
           EOF
 
       # Step 8: Post comments — two-tier, zero lost
       #
-      # TIER 1 — Inline: only lines confirmed in GitHub's diff (valid_lines.json).
-      #           These will never 422.
-      # TIER 2 — Fallback PR comment: anything outside the diff view, or any
-      #           unexpected failure, is recovered here as a consolidated comment.
-      #           Nothing is ever silently dropped.
-      #
-      # Saves posting_stats.json so Step 10 summary shows accurate numbers.
+      # TIER 1 — Inline: lines confirmed in GitHub's diff (valid_lines.json)
+      # TIER 2 — Fallback PR comment: anything outside diff view, never lost
       - name: Post comments (inline + fallback for out-of-diff lines)
         if: steps.check_reviewed.outputs.already_reviewed == 'false' && steps.validate_diff.outputs.too_large == 'false'
         env:
@@ -388,7 +511,7 @@ jobs:
           pr_number  = os.environ["PR_NUMBER"]
           commit_sha = os.environ["PR_COMMIT_SHA"]
 
-          posted = 0
+          posted   = 0
           fallback = []
 
           for item in comments:
@@ -467,7 +590,7 @@ jobs:
             -d '{"labels":["ai-reviewed"]}'
           echo "Label ai-reviewed applied"
 
-      # Step 10: Post final summary — reads accurate counts from posting_stats.json
+      # Step 10: Post final summary
       - name: Post summary comment
         if: steps.check_reviewed.outputs.already_reviewed == 'false' && steps.validate_diff.outputs.too_large == 'false'
         env:
@@ -488,22 +611,41 @@ jobs:
           fallback = stats["fallback"]
           total    = inline + fallback
 
+          # Build per-file breakdown for the summary
+          file_summary = {}
+          with open("line_comments.json") as f:
+              comments = json.load(f)
+          for c in comments:
+              file_summary[c["file"]] = file_summary.get(c["file"], 0) + 1
+
+          files_reviewed = len({c["file"] for c in chunks})
+
+          file_rows = ""
+          for filepath, count in sorted(file_summary.items()):
+              file_rows += f"| `{filepath}` | {count} |\n"
+          if not file_rows:
+              file_rows = "| — | 0 |\n"
+
           fallback_note = (
               f"\n> \U0001f4dd **{fallback} finding(s)** could not be posted inline "
-              "(outside diff view) and appear in the **AI Review \u2014 Additional Findings** comment above."
+              "(outside diff view) \u2014 see the **AI Review \u2014 Additional Findings** comment above."
               if fallback > 0 else ""
           )
 
           body = (
-              "\u2705 **AI Code Review Complete**\n\n"
+              "\U0001f916 **AI Code Review Complete**\n\n"
               f"| | |\n|---|---|\n"
+              f"| Files reviewed | {files_reviewed} |\n"
               f"| Lines reviewed | {os.environ.get('TOTAL_LINES', '?')} |\n"
-              f"| Chunks processed | {len(chunks)} |\n"
               f"| Inline comments | {inline} |\n"
               f"| Fallback comments | {fallback} |\n"
               f"| Total findings | {total} |\n"
               f"| Label | `ai-reviewed` |\n"
-              f"{fallback_note}\n\n"
+              "\n"
+              "**Findings by file:**\n\n"
+              "| File | Comments |\n|---|---|\n"
+              + file_rows
+              + f"{fallback_note}\n\n"
               "\u26a0\ufe0f **AI review is a one-time pass. Please fix all comments above, "
               "then request a peer review from your teammates. AI will not review this PR again.**"
           )
