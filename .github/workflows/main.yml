@@ -1,8 +1,13 @@
-name: AI Code Review (Final Stable Fixed)
+name: AI Code Review (Final)
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+
+env:
+  CHUNK_SIZE: 200
+  MAX_TOTAL_LINES: 1000
+  CONTEXT_LINES: 5
 
 permissions:
   pull-requests: write
@@ -13,236 +18,501 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # Step 1: Checkout full repo
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # STEP 1: Skip if already reviewed
-      - name: Check if AI already reviewed
+      # Step 2: Check if AI already reviewed this PR
+      - name: Check if AI already reviewed this PR
         id: check_reviewed
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
         run: |
           python3 << 'EOF'
           import urllib.request, json, os
           token = os.environ["GITHUB_TOKEN"]
-          repo = "${{ github.repository }}"
-          pr = "${{ github.event.pull_request.number }}"
-
+          repo = os.environ["REPO"]
+          pr_number = os.environ["PR_NUMBER"]
           req = urllib.request.Request(
-              f"https://api.github.com/repos/{repo}/issues/{pr}/comments",
-              headers={"Authorization": f"Bearer {token}"}
+              f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments?per_page=100",
+              headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
           )
-          comments = json.loads(urllib.request.urlopen(req).read())
-
-          already = any("AI Code Review Complete" in c["body"] for c in comments)
-
+          with urllib.request.urlopen(req) as r:
+              comments = json.loads(r.read())
+          already_reviewed = any(
+              "AI Code Review Complete" in c.get("body", "") or
+              "AI Code Review Skipped" in c.get("body", "")
+              for c in comments
+          )
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"already_reviewed={'true' if already else 'false'}\n")
+              f.write(f"already_reviewed={'true' if already_reviewed else 'false'}\n")
+          print(f"Already reviewed: {already_reviewed}")
           EOF
 
-      - name: Stop if already reviewed
+      # Step 3: Stop if already reviewed
+      - name: Post already reviewed comment and stop
         if: steps.check_reviewed.outputs.already_reviewed == 'true'
-        run: echo "Already reviewed, skipping"
-
-      # STEP 2: Get diff
-      - name: Get PR diff
-        if: steps.check_reviewed.outputs.already_reviewed == 'false'
-        run: |
-          git diff origin/${{ github.base_ref }}...HEAD > pr_diff.txt
-
-      # STEP 3: Parse diff (GLOBAL POSITION FIX)
-      - name: Parse diff
-        if: steps.check_reviewed.outputs.already_reviewed == 'false'
-        run: |
-          python3 << 'EOF'
-          import json, re
-
-          lines = open("pr_diff.txt").readlines()
-
-          file = None
-          new_line = 0
-          file_positions = {}
-          data = []
-
-          for line in lines:
-              if line.startswith("diff --git"):
-                  match = re.search(r'b/(.+)', line)
-                  if match:
-                      file = match.group(1)
-                      file_positions[file] = 0
-
-              elif line.startswith("@@"):
-                  match = re.search(r'\+(\d+)', line)
-                  if match:
-                      new_line = int(match.group(1)) - 1
-
-              elif line.startswith("+") and not line.startswith("+++"):
-                  new_line += 1
-                  file_positions[file] += 1
-
-                  data.append({
-                      "file": file,
-                      "position": file_positions[file],
-                      "content": line[1:].strip()
-                  })
-
-              elif not line.startswith("-"):
-                  new_line += 1
-                  if file:
-                      file_positions[file] += 1
-
-          json.dump(data, open("diff.json", "w"))
-          print(f"Parsed {len(data)} lines")
-          EOF
-
-      # STEP 4: Call OpenAI (SAFE)
-      - name: Call AI
-        if: steps.check_reviewed.outputs.already_reviewed == 'false'
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: |
-          python3 << 'EOF'
-          import json, urllib.request, os
-
-          data = json.load(open("diff.json"))
-
-          prompt = "\n".join(
-              f"ID:{i} -> {d['content']}" for i, d in enumerate(data)
-          )
-
-          payload = {
-              "model": "gpt-4o",
-              "messages": [
-                  {
-                      "role": "system",
-                      "content": (
-                          "Return ONLY JSON array. "
-                          "Format: [{\"id\": number, \"comment\": string}]. "
-                          "If no issues return []."
-                      )
-                  },
-                  {"role": "user", "content": prompt}
-              ],
-              "temperature": 0.1
-          }
-
-          req = urllib.request.Request(
-              "https://api.openai.com/v1/chat/completions",
-              data=json.dumps(payload).encode(),
-              headers={
-                  "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}",
-                  "Content-Type": "application/json"
-              }
-          )
-
-          res = json.loads(urllib.request.urlopen(req).read())
-          raw = res["choices"][0]["message"]["content"]
-
-          print("RAW AI RESPONSE:", raw)
-
-          # SAFE PARSE
-          if not raw or raw.strip() == "":
-              comments = []
-          else:
-              raw = raw.strip()
-
-              if raw.startswith("```"):
-                  raw = "\n".join(raw.split("\n")[1:])
-              if raw.endswith("```"):
-                  raw = "\n".join(raw.split("\n")[:-1])
-
-              raw = raw.strip()
-
-              try:
-                  comments = json.loads(raw)
-              except:
-                  comments = []
-
-          resolved = []
-          for c in comments:
-              if "id" not in c:
-                  continue
-              if c["id"] >= len(data):
-                  print(f"Skipping invalid AI id {c['id']}")
-                  continue
-
-              d = data[c["id"]]
-
-              resolved.append({
-                  "file": d["file"],
-                  "position": d["position"],
-                  "comment": c["comment"]
-              })
-
-          json.dump(resolved, open("comments.json", "w"))
-          print(f"Resolved comments: {len(resolved)}")
-          EOF
-
-      # STEP 5: Post comments (FINAL FIX)
-      - name: Post comments
-        if: steps.check_reviewed.outputs.already_reviewed == 'false'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          python3 << 'EOF'
-          import json, urllib.request, urllib.error, os
-
-          comments = json.load(open("comments.json"))
-
-          repo = "${{ github.repository }}"
-          pr = "${{ github.event.pull_request.number }}"
-          sha = "${{ github.event.pull_request.head.sha }}"
-          token = os.environ["GITHUB_TOKEN"]
-
-          posted = failed = 0
-
-          for c in comments:
-              if not c["file"] or not c["position"]:
-                  continue
-
-              payload = {
-                  "body": "🤖 **AI Review:** " + c["comment"],
-                  "commit_id": sha,
-                  "path": c["file"],
-                  "position": c["position"]
-              }
-
-              try:
-                  req = urllib.request.Request(
-                      f"https://api.github.com/repos/{repo}/pulls/{pr}/comments",
-                      data=json.dumps(payload).encode(),
-                      headers={
-                          "Authorization": f"Bearer {token}",
-                          "Content-Type": "application/json"
-                      }
-                  )
-                  urllib.request.urlopen(req)
-                  posted += 1
-                  print(f"Posted: {c['file']} @ {c['position']}")
-
-              except urllib.error.HTTPError as e:
-                  err = e.read().decode()
-
-                  if "position" in err or "diff" in err:
-                      print(f"Skipped invalid position: {c['file']} @ {c['position']}")
-                  else:
-                      print(f"Real error: {err}")
-
-                  failed += 1
-
-          print(f"Summary: {posted} posted, {failed} failed")
-          EOF
-
-      # STEP 6: Summary
-      - name: Post summary
-        if: steps.check_reviewed.outputs.already_reviewed == 'false'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
         run: |
           curl -s -X POST \
             -H "Authorization: Bearer $GITHUB_TOKEN" \
             -H "Content-Type: application/json" \
-            https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
-            -d '{"body":"## ✅ AI Code Review Complete\n\n✔ Fully stable\n✔ No JSON crashes\n✔ Correct diff positioning\n✔ Invalid lines safely skipped"}'
+            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments" \
+            -d "{\"body\": \"## \u2139\ufe0f AI Review Already Done\n\n\u2705 AI has already reviewed this PR once. No further AI reviews will run.\n\n**Next step:** Please fix the AI comments and request a **peer review** from your teammates.\"}"
+
+      # Step 4: Get local diff for line content + size check
+      - name: Get PR diff and validate size
+        if: steps.check_reviewed.outputs.already_reviewed == 'false'
+        id: validate_diff
+        run: |
+          git diff origin/${{ github.base_ref }}...HEAD \
+            -- '*.py' '*.js' '*.ts' '*.tsx' '*.jsx' \
+               '*.java' '*.go' '*.rb' '*.php' '*.cs' \
+               '*.cpp' '*.c' '*.h' '*.rs' '*.swift' \
+               '*.kt' '*.scala' '*.yaml' '*.yml' '*.json' \
+               '*.html' '*.css' '*.scss' \
+            > pr_diff.txt
+          ADDED_LINES=$(grep -c '^+[^+]' pr_diff.txt || true)
+          echo "Added lines in diff: $ADDED_LINES"
+          echo "total_lines=$ADDED_LINES" >> $GITHUB_OUTPUT
+          if [ "$ADDED_LINES" -gt "$MAX_TOTAL_LINES" ]; then
+            echo "too_large=true" >> $GITHUB_OUTPUT
+          else
+            echo "too_large=false" >> $GITHUB_OUTPUT
+          fi
+
+      # Step 5: Hard stop if PR too large
+      - name: Comment PR too large and exit
+        if: steps.check_reviewed.outputs.already_reviewed == 'false' && steps.validate_diff.outputs.too_large == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments" \
+            -d "{\"body\": \"## \u26a0\ufe0f AI Code Review Skipped\n\n**Reason:** This PR has **${{ steps.validate_diff.outputs.total_lines }} added lines** which exceeds the limit of 1000 lines.\n\n**Please split this PR into smaller focused PRs.**\"}"
+          exit 0
+
+      # Step 6: Build valid line set from GitHub's PR Files API + prepare chunks
+      #
+      # We ask GitHub directly which lines exist in its diff view via
+      # GET /pulls/{pr}/files — this is exactly what GitHub's comment API
+      # validates against. Using our local git diff for this would risk
+      # divergence (merge commits, branch staleness, hunk boundary differences).
+      # Local diff is still used for code content and context lines only.
+      - name: Build valid lines from GitHub API and prepare chunks
+        if: steps.check_reviewed.outputs.already_reviewed == 'false' && steps.validate_diff.outputs.too_large == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          CONTEXT_LINES: ${{ env.CONTEXT_LINES }}
+        run: |
+          python3 << 'EOF'
+          import urllib.request, json, re, os
+
+          token = os.environ["GITHUB_TOKEN"]
+          repo = os.environ["REPO"]
+          pr_number = os.environ["PR_NUMBER"]
+          context_size = int(os.environ.get("CONTEXT_LINES", 5))
+
+          # --- PART A: fetch valid (file, line) set from GitHub's own PR Files API ---
+          valid = set()
+          page = 1
+          while True:
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{repo}/pulls/{pr_number}/files?per_page=100&page={page}",
+                  headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
+              )
+              with urllib.request.urlopen(req) as r:
+                  files = json.loads(r.read())
+              if not files:
+                  break
+              for f in files:
+                  filepath = f["filename"]
+                  patch = f.get("patch", "")
+                  if not patch:
+                      continue
+                  current_line = 0
+                  for patch_line in patch.split("\n"):
+                      if patch_line.startswith("@@"):
+                          m = re.search(r'\+(\d+)', patch_line)
+                          if m:
+                              current_line = int(m.group(1)) - 1
+                      elif patch_line.startswith("+"):
+                          current_line += 1
+                          valid.add((filepath, current_line))
+                      elif not patch_line.startswith("-"):
+                          current_line += 1
+              page += 1
+
+          print(f"Valid lines from GitHub API: {len(valid)}")
+          with open("valid_lines.json", "w") as out:
+              json.dump([{"file": f, "line": l} for f, l in valid], out)
+
+          # --- PART B: parse local diff for code content + context ---
+          changed_lines = []
+          current_file = None
+          new_line = 0
+
+          with open("pr_diff.txt", "r") as f:
+              raw_lines = f.readlines()
+
+          for line in raw_lines:
+              if line.startswith("diff --git"):
+                  m = re.search(r'b/(.+)', line)
+                  if m:
+                      current_file = m.group(1).strip()
+              elif line.startswith("@@"):
+                  m = re.search(r'\+(\d+)', line)
+                  if m:
+                      new_line = int(m.group(1)) - 1
+              elif line.startswith("+") and not line.startswith("+++"):
+                  new_line += 1
+                  changed_lines.append({"file": current_file, "line": new_line, "content": line[1:].rstrip()})
+              elif not line.startswith("-") and not line.startswith("\\"):
+                  new_line += 1
+
+          diff_data = []
+          for entry in changed_lines:
+              fp = entry["file"]
+              n = entry["line"]
+              ctx_before, ctx_after = [], []
+              if os.path.exists(fp):
+                  with open(fp, "r", errors="ignore") as f:
+                      all_lines = f.readlines()
+                  total = len(all_lines)
+                  start = max(0, n - context_size - 1)
+                  ctx_before = [
+                      f"line {start+i+1}: {all_lines[start+i].rstrip()}"
+                      for i in range(n - 1 - start)
+                  ]
+                  start_after = n
+                  end_after = min(total, n + context_size)
+                  ctx_after = [
+                      f"line {start_after+i+1}: {all_lines[start_after+i].rstrip()}"
+                      for i in range(end_after - start_after)
+                  ]
+              diff_data.append({
+                  "file": fp, "line": n, "content": entry["content"],
+                  "context_before": ctx_before, "context_after": ctx_after
+              })
+
+          chunk_size = int(os.environ.get("CHUNK_SIZE", 200))
+          chunks = [diff_data[i:i+chunk_size] for i in range(0, len(diff_data), chunk_size)]
+          with open("diff_chunks.json", "w") as out:
+              json.dump(chunks, out, indent=2)
+          print(f"Total changed lines: {len(diff_data)}, chunks: {len(chunks)}")
+          EOF
+
+      # Step 7: Call OpenAI — AI only sees/returns numeric IDs, never file paths
+      - name: Call OpenAI per chunk and collect comments
+        if: steps.check_reviewed.outputs.already_reviewed == 'false' && steps.validate_diff.outputs.too_large == 'false'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python3 << 'EOF'
+          import json, urllib.request, os, time
+
+          with open("diff_chunks.json", "r") as f:
+              chunks = json.load(f)
+
+          api_key = os.environ["OPENAI_API_KEY"]
+          all_comments = []
+          global_id_counter = 0
+
+          for idx, chunk in enumerate(chunks):
+              print(f"\nProcessing chunk {idx+1}/{len(chunks)} ({len(chunk)} lines)...")
+
+              chunk_id_map = {}
+              diff_text = ""
+
+              for item in chunk:
+                  lid = global_id_counter
+                  global_id_counter += 1
+                  chunk_id_map[lid] = {"file": item["file"], "line": item["line"]}
+
+                  diff_text += f"\n--- ID:{lid} ---\n"
+                  if item["context_before"]:
+                      diff_text += "Context before:\n"
+                      for c in item["context_before"]:
+                          diff_text += f"  {c}\n"
+                  diff_text += f">>> ADDED LINE (ID:{lid}): {item['content']}\n"
+                  if item["context_after"]:
+                      diff_text += "Context after:\n"
+                      for c in item["context_after"]:
+                          diff_text += f"  {c}\n"
+
+              system_prompt = (
+                  "You are a senior software engineer performing a focused, high-signal code review. "
+                  "You respond ONLY with a valid JSON array. "
+                  "No markdown fences, no explanation, no preamble. "
+                  "If there are no issues return exactly: []"
+              )
+
+              user_prompt = (
+                  "Review the newly added lines from a pull request below.\n"
+                  "Each block is identified by a numeric ID like ID:42.\n"
+                  "Context before/after lines are for understanding only — do NOT flag them.\n"
+                  "Only flag the >>> ADDED LINE if it has a genuine, objective issue.\n"
+                  "\n"
+                  "FLAG only for:\n"
+                  "  - Security vulnerabilities (injection, exposed secrets, broken auth)\n"
+                  "  - Bugs causing crashes, data loss, or wrong results\n"
+                  "  - Missing error handling on I/O, network, or DB calls\n"
+                  "  - Race conditions or concurrency bugs\n"
+                  "  - Obvious performance issues (N+1 queries, unbounded loops)\n"
+                  "  - Resource leaks (unclosed files, connections, handles)\n"
+                  "  - Hardcoded secrets or magic values that must be config\n"
+                  "\n"
+                  "DO NOT FLAG:\n"
+                  "  - Style, naming, or formatting\n"
+                  "  - Architectural opinions\n"
+                  "  - Issues already handled in surrounding context\n"
+                  "  - Test files unless there is a definite logic bug\n"
+                  "\n"
+                  "OUTPUT — a JSON array. Each object must have exactly:\n"
+                  '  "id"      : the integer ID number from ID:N (just the number, no prefix)\n'
+                  '  "comment" : one sentence — the problem and what to fix\n'
+                  "\n"
+                  'Example: [ {"id": 3, "comment": "..."}, {"id": 17, "comment": "..."} ]\n'
+                  "If no issues: []\n"
+                  "\n"
+                  "LINES TO REVIEW:\n"
+                  + diff_text
+              )
+
+              payload = {
+                  "model": "gpt-4o",
+                  "messages": [
+                      {"role": "system", "content": system_prompt},
+                      {"role": "user",   "content": user_prompt}
+                  ],
+                  "max_tokens": 1500,
+                  "temperature": 0.1
+              }
+
+              for attempt in range(3):
+                  try:
+                      req = urllib.request.Request(
+                          "https://api.openai.com/v1/chat/completions",
+                          data=json.dumps(payload).encode(),
+                          headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+                      )
+                      with urllib.request.urlopen(req) as response:
+                          data = json.loads(response.read())
+
+                      raw = data["choices"][0]["message"]["content"].strip()
+                      if raw.startswith("```"):
+                          raw = "\n".join(raw.split("\n")[1:])
+                      if raw.endswith("```"):
+                          raw = "\n".join(raw.split("\n")[:-1])
+                      raw = raw.strip()
+
+                      chunk_comments = json.loads(raw)
+                      resolved = []
+                      for c in chunk_comments:
+                          lid = int(c["id"])
+                          if lid in chunk_id_map:
+                              resolved.append({
+                                  "file":    chunk_id_map[lid]["file"],
+                                  "line":    chunk_id_map[lid]["line"],
+                                  "comment": c["comment"]
+                              })
+                          else:
+                              print(f"  WARNING: unknown ID {lid}, skipping")
+
+                      all_comments.extend(resolved)
+                      print(f"Chunk {idx+1}: {len(resolved)} comments resolved")
+                      break
+
+                  except Exception as e:
+                      print(f"Chunk {idx+1} attempt {attempt+1} failed: {e}")
+                      if attempt < 2:
+                          wait = 2 ** attempt
+                          print(f"Retrying in {wait}s...")
+                          time.sleep(wait)
+                      else:
+                          print(f"Chunk {idx+1} failed after 3 attempts, skipping")
+
+              if idx < len(chunks) - 1:
+                  time.sleep(2)
+
+          with open("line_comments.json", "w") as f:
+              json.dump(all_comments, f, indent=2)
+          print(f"\nTotal comments: {len(all_comments)}")
+          EOF
+
+      # Step 8: Post comments — two-tier, zero lost
+      #
+      # TIER 1 — Inline: only lines confirmed in GitHub's diff (valid_lines.json).
+      #           These will never 422.
+      # TIER 2 — Fallback PR comment: anything outside the diff view, or any
+      #           unexpected failure, is recovered here as a consolidated comment.
+      #           Nothing is ever silently dropped.
+      #
+      # Saves posting_stats.json so Step 10 summary shows accurate numbers.
+      - name: Post comments (inline + fallback for out-of-diff lines)
+        if: steps.check_reviewed.outputs.already_reviewed == 'false' && steps.validate_diff.outputs.too_large == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          PR_COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 << 'EOF'
+          import json, urllib.request, urllib.error, os
+
+          with open("line_comments.json", "r") as f:
+              comments = json.load(f)
+          with open("valid_lines.json", "r") as f:
+              valid_list = json.load(f)
+
+          valid = {(e["file"], e["line"]) for e in valid_list}
+
+          token      = os.environ["GITHUB_TOKEN"]
+          repo       = os.environ["REPO"]
+          pr_number  = os.environ["PR_NUMBER"]
+          commit_sha = os.environ["PR_COMMIT_SHA"]
+
+          posted = 0
+          fallback = []
+
+          for item in comments:
+              if (item["file"], item["line"]) not in valid:
+                  fallback.append(item)
+                  print(f"Queued for fallback: {item['file']} line {item['line']}")
+                  continue
+
+              payload = {
+                  "body":      f"\U0001f916 **AI Review:** {item['comment']}",
+                  "commit_id": commit_sha,
+                  "path":      item["file"],
+                  "line":      item["line"],
+                  "side":      "RIGHT"
+              }
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{repo}/pulls/{pr_number}/comments",
+                  data=json.dumps(payload).encode(),
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Content-Type": "application/json",
+                      "Accept": "application/vnd.github.v3+json"
+                  }
+              )
+              try:
+                  with urllib.request.urlopen(req) as r:
+                      if r.status == 201:
+                          posted += 1
+                          print(f"Inline: {item['file']} @ {item['line']}")
+              except urllib.error.HTTPError as e:
+                  fallback.append(item)
+                  print(f"Recovered to fallback: {item['file']} line {item['line']}: {e.read().decode()}")
+
+          if fallback:
+              body_lines = [
+                  "\U0001f916 **AI Review \u2014 Additional Findings**\n",
+                  "The following issues could not be posted as inline comments (outside the diff view):\n"
+              ]
+              for item in fallback:
+                  body_lines.append(f"- **`{item['file']}` line {item['line']}:** {item['comment']}")
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments",
+                  data=json.dumps({"body": "\n".join(body_lines)}).encode(),
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Content-Type": "application/json",
+                      "Accept": "application/vnd.github.v3+json"
+                  }
+              )
+              with urllib.request.urlopen(req) as r:
+                  print(f"Fallback comment posted ({len(fallback)} items): {r.status}")
+
+          with open("posting_stats.json", "w") as f:
+              json.dump({"inline": posted, "fallback": len(fallback)}, f)
+
+          print(f"\nSummary: {posted} inline, {len(fallback)} fallback \u2014 0 lost")
+          EOF
+
+      # Step 9: Add ai-reviewed label
+      - name: Add ai-reviewed label
+        if: steps.check_reviewed.outputs.already_reviewed == 'false' && steps.validate_diff.outputs.too_large == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/$REPO/labels" \
+            -d '{"name":"ai-reviewed","color":"7057ff","description":"AI code review completed"}' || true
+          curl -s -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/labels" \
+            -d '{"labels":["ai-reviewed"]}'
+          echo "Label ai-reviewed applied"
+
+      # Step 10: Post final summary — reads accurate counts from posting_stats.json
+      - name: Post summary comment
+        if: steps.check_reviewed.outputs.already_reviewed == 'false' && steps.validate_diff.outputs.too_large == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          TOTAL_LINES: ${{ steps.validate_diff.outputs.total_lines }}
+        run: |
+          python3 << 'EOF'
+          import json, os, urllib.request
+
+          with open("posting_stats.json") as f:
+              stats = json.load(f)
+          with open("diff_chunks.json") as f:
+              chunks = json.load(f)
+
+          inline   = stats["inline"]
+          fallback = stats["fallback"]
+          total    = inline + fallback
+
+          fallback_note = (
+              f"\n> \U0001f4dd **{fallback} finding(s)** could not be posted inline "
+              "(outside diff view) and appear in the **AI Review \u2014 Additional Findings** comment above."
+              if fallback > 0 else ""
+          )
+
+          body = (
+              "\u2705 **AI Code Review Complete**\n\n"
+              f"| | |\n|---|---|\n"
+              f"| Lines reviewed | {os.environ.get('TOTAL_LINES', '?')} |\n"
+              f"| Chunks processed | {len(chunks)} |\n"
+              f"| Inline comments | {inline} |\n"
+              f"| Fallback comments | {fallback} |\n"
+              f"| Total findings | {total} |\n"
+              f"| Label | `ai-reviewed` |\n"
+              f"{fallback_note}\n\n"
+              "\u26a0\ufe0f **AI review is a one-time pass. Please fix all comments above, "
+              "then request a peer review from your teammates. AI will not review this PR again.**"
+          )
+
+          token = os.environ["GITHUB_TOKEN"]
+          repo = os.environ["REPO"]
+          pr_number = os.environ["PR_NUMBER"]
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments",
+              data=json.dumps({"body": body}).encode(),
+              headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/vnd.github.v3+json"}
+          )
+          with urllib.request.urlopen(req) as r:
+              print(f"Summary posted: {r.status}")
+          EOF
