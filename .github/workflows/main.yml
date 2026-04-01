@@ -141,26 +141,34 @@ jobs:
 
           exit 0
 
-      # Step 6: Build valid lines from GitHub API + file-level chunks
-      - name: Build valid lines from GitHub API and prepare file-level chunks
+      # Step 6: Prepare per-file diffs like a senior engineer sees them
+      # Strategy: Send the full unified diff per file (same view as GitHub PR tab)
+      # For files under 500 lines, also send the complete file so AI has full context
+      - name: Prepare per-file review packages
         if: steps.check_reviewed.outputs.already_reviewed == 'false' && steps.validate_diff.outputs.too_large == 'false'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
-          CONTEXT_LINES: ${{ env.CONTEXT_LINES }}
-          MAX_LINES_PER_FILE: ${{ env.MAX_LINES_PER_FILE }}
         run: |
           python3 << 'EOF'
           import urllib.request, json, re, os
 
-          token        = os.environ["GITHUB_TOKEN"]
-          repo         = os.environ["REPO"]
-          pr_number    = os.environ["PR_NUMBER"]
-          context_size = int(os.environ.get("CONTEXT_LINES", 10))
-          max_per_file = int(os.environ.get("MAX_LINES_PER_FILE", 300))
+          token = os.environ["GITHUB_TOKEN"]
+          repo = os.environ["REPO"]
+          pr_number = os.environ["PR_NUMBER"]
 
-          # --- PART A: valid lines from GitHub PR Files API ---
+          LANG_MAP = {
+              "js": "JavaScript", "ts": "TypeScript", "tsx": "TypeScript/React",
+              "jsx": "JavaScript/React", "py": "Python", "java": "Java",
+              "go": "Go", "rb": "Ruby", "php": "PHP", "cs": "C#",
+              "cpp": "C++", "c": "C", "h": "C/C++ Header", "rs": "Rust",
+              "swift": "Swift", "kt": "Kotlin", "scala": "Scala",
+              "yaml": "YAML", "yml": "YAML", "json": "JSON",
+              "html": "HTML", "css": "CSS", "scss": "SCSS"
+          }
+
+          # --- PART A: Get valid commentable lines from GitHub API ---
           valid = set()
           page = 1
           while True:
@@ -173,7 +181,6 @@ jobs:
               if not files:
                   break
               for f in files:
-                  filepath = f["filename"]
                   patch = f.get("patch", "")
                   if not patch:
                       continue
@@ -185,125 +192,86 @@ jobs:
                               current_line = int(m.group(1)) - 1
                       elif patch_line.startswith("+"):
                           current_line += 1
-                          valid.add((filepath, current_line))
+                          valid.add((f["filename"], current_line))
                       elif not patch_line.startswith("-"):
                           current_line += 1
               page += 1
 
-          print(f"Valid lines from GitHub API: {len(valid)}")
           with open("valid_lines.json", "w") as out:
               json.dump([{"file": f, "line": l} for f, l in valid], out)
+          print(f"Valid commentable lines: {len(valid)}")
 
-          # --- PART B: language map ---
-          LANG_MAP = {
-              "js": "JavaScript", "ts": "TypeScript", "tsx": "TypeScript/React",
-              "jsx": "JavaScript/React", "py": "Python", "java": "Java",
-              "go": "Go", "rb": "Ruby", "php": "PHP", "cs": "C#",
-              "cpp": "C++", "c": "C", "h": "C/C++ Header", "rs": "Rust",
-              "swift": "Swift", "kt": "Kotlin", "scala": "Scala",
-              "yaml": "YAML", "yml": "YAML", "json": "JSON",
-              "html": "HTML", "css": "CSS", "scss": "SCSS"
-          }
-          def get_language(fp):
-              ext = fp.rsplit(".", 1)[-1].lower() if "." in fp else ""
-              return LANG_MAP.get(ext, "Unknown")
-
-          # --- PART C: parse local diff grouped by file ---
-          files_data = {}
-          current_file = None
-          new_line = 0
+          # --- PART B: Split pr_diff.txt into per-file unified diffs ---
           with open("pr_diff.txt", "r") as f:
-              raw_lines = f.readlines()
+              full_diff = f.read()
 
-          for line in raw_lines:
+          file_diffs = {}
+          current_file = None
+          current_lines = []
+
+          for line in full_diff.split("\n"):
               if line.startswith("diff --git"):
-                  parts = line.strip().split(" b/")
-                  if len(parts) >= 2:
-                      current_file = parts[-1].strip()
-                      if current_file not in files_data:
-                          files_data[current_file] = []
-                  new_line = 0
-              elif line.startswith("@@"):
-                  m = re.search(r'\+(\d+)', line)
-                  if m:
-                      new_line = int(m.group(1)) - 1
-              elif line.startswith("+") and not line.startswith("+++"):
-                  new_line += 1
-                  if current_file:
-                      files_data[current_file].append({"line": new_line, "content": line[1:].rstrip()})
-              elif not line.startswith("-") and not line.startswith("\\"):
-                  new_line += 1
+                  if current_file and current_lines:
+                      file_diffs[current_file] = "\n".join(current_lines)
+                  parts = line.split(" b/")
+                  current_file = parts[-1].strip() if len(parts) >= 2 else None
+                  current_lines = [line]
+              else:
+                  current_lines.append(line)
 
-          # --- PART D: enrich with context + assign IDs, chunk by file ---
-          chunks = []
-          global_id_counter = 0
+          if current_file and current_lines:
+              file_diffs[current_file] = "\n".join(current_lines)
 
-          for filepath, added_lines in files_data.items():
-              if not added_lines:
-                  continue
-              all_file_lines = []
+          # --- PART C: Build review packages per file ---
+          review_packages = []
+
+          for filepath, diff_content in file_diffs.items():
+              ext = filepath.rsplit(".", 1)[-1].lower() if "." in filepath else ""
+              language = LANG_MAP.get(ext, "Unknown")
+
+              # Count added lines in this file's diff
+              added_count = sum(1 for l in diff_content.split("\n")
+                              if l.startswith("+") and not l.startswith("+++"))
+
+              # Read full file if it exists and is under 500 lines
+              full_file_content = ""
+              total_lines = 0
               if os.path.exists(filepath):
                   with open(filepath, "r", errors="ignore") as f:
-                      all_file_lines = f.readlines()
-              total_file_lines = len(all_file_lines)
-              language = get_language(filepath)
+                      file_lines = f.readlines()
+                  total_lines = len(file_lines)
+                  if total_lines <= 500:
+                      numbered = []
+                      for i, line in enumerate(file_lines, 1):
+                          numbered.append(f"{i:4d} | {line.rstrip()}")
+                      full_file_content = "\n".join(numbered)
 
-              enriched = []
-              for entry in added_lines:
-                  n   = entry["line"]
-                  lid = global_id_counter
-                  global_id_counter += 1
-                  ctx_before, ctx_after = [], []
-                  if all_file_lines:
-                      start = max(0, n - context_size - 1)
-                      ctx_before = [
-                          f"line {start+i+1}: {all_file_lines[start+i].rstrip()}"
-                          for i in range(n - 1 - start)
-                      ]
-                      start_after = n
-                      end_after = min(total_file_lines, n + context_size)
-                      ctx_after = [
-                          f"line {start_after+i+1}: {all_file_lines[start_after+i].rstrip()}"
-                          for i in range(end_after - start_after)
-                      ]
-                  enriched.append({
-                      "id": lid, "line": n,
-                      "content": entry["content"],
-                      "context_before": ctx_before,
-                      "context_after":  ctx_after
-                  })
+              # Get valid line numbers for this file
+              file_valid_lines = sorted([l for f, l in valid if f == filepath])
 
-              if len(enriched) <= max_per_file:
-                  parts_list = [enriched]
-              else:
-                  parts_list, current_part = [], []
-                  for item in enriched:
-                      current_part.append(item)
-                      if len(current_part) >= max_per_file and item["content"].strip() == "":
-                          parts_list.append(current_part)
-                          current_part = []
-                  if current_part:
-                      parts_list.append(current_part)
+              review_packages.append({
+                  "file": filepath,
+                  "language": language,
+                  "total_lines": total_lines,
+                  "added_lines": added_count,
+                  "diff": diff_content,
+                  "full_file": full_file_content,
+                  "valid_lines": file_valid_lines
+              })
 
-              for part_idx, part in enumerate(parts_list):
-                  part_label = f" (part {part_idx+1}/{len(parts_list)})" if len(parts_list) > 1 else ""
-                  chunks.append({
-                      "file": filepath, "language": language,
-                      "total_file_lines": total_file_lines,
-                      "part_label": part_label, "lines": part
-                  })
+          with open("review_packages.json", "w") as out:
+              json.dump(review_packages, out, indent=2)
 
-          with open("diff_chunks.json", "w") as out:
-              json.dump(chunks, out, indent=2)
-
-          total_added = sum(len(c["lines"]) for c in chunks)
-          print(f"Files: {len(files_data)}, chunks: {len(chunks)}, lines: {total_added}")
-          for c in chunks:
-              print(f"  {c['file']}{c['part_label']}: {len(c['lines'])} added lines")
+          print(f"Files: {len(review_packages)}")
+          for pkg in review_packages:
+              ctx = "with full file" if pkg["full_file"] else "diff only"
+              print(f"  {pkg['file']}: {pkg['added_lines']} added, {pkg['total_lines']} total ({ctx})")
           EOF
 
-      # Step 7: Call OpenAI per file chunk — collect review comments
-      - name: Call OpenAI per file chunk and collect comments
+      # Step 7: AI reviews each file like a senior engineer
+      # Sends: full unified diff + complete file content (for files < 500 lines)
+      # The AI sees exactly what you see in the GitHub PR "Files changed" tab
+      - name: AI code review per file
         if: steps.check_reviewed.outputs.already_reviewed == 'false' && steps.validate_diff.outputs.too_large == 'false'
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -311,84 +279,86 @@ jobs:
           python3 << 'EOF'
           import json, urllib.request, os, time
 
-          with open("diff_chunks.json", "r") as f:
-              chunks = json.load(f)
+          with open("review_packages.json", "r") as f:
+              packages = json.load(f)
 
           api_key = os.environ["OPENAI_API_KEY"]
           all_comments = []
 
-          id_map = {}
-          for chunk in chunks:
-              for item in chunk["lines"]:
-                  id_map[item["id"]] = {"file": chunk["file"], "line": item["line"]}
+          for idx, pkg in enumerate(packages):
+              filepath = pkg["file"]
+              language = pkg["language"]
+              total_lines = pkg["total_lines"]
+              added_lines = pkg["added_lines"]
+              diff = pkg["diff"]
+              full_file = pkg["full_file"]
+              valid_lines = pkg["valid_lines"]
 
-          for idx, chunk in enumerate(chunks):
-              filepath    = chunk["file"]
-              language    = chunk["language"]
-              total_lines = chunk["total_file_lines"]
-              part_label  = chunk["part_label"]
-              added_lines = chunk["lines"]
+              print(f"\nReviewing: {filepath} ({added_lines} added in {total_lines}-line {language} file)")
 
-              print(f"\nReviewing: {filepath}{part_label} ({len(added_lines)} changes in {total_lines}-line file)")
-
-              diff_text = ""
-              for item in added_lines:
-                  diff_text += f"\n--- ID:{item['id']} (line {item['line']}) ---\n"
-                  if item["context_before"]:
-                      diff_text += "Context before:\n"
-                      for c in item["context_before"]:
-                          diff_text += f"  {c}\n"
-                  diff_text += f">>> ADDED LINE {item['line']} (ID:{item['id']}): {item['content']}\n"
-                  if item["context_after"]:
-                      diff_text += "Context after:\n"
-                      for c in item["context_after"]:
-                          diff_text += f"  {c}\n"
-
+              # --- Build the prompt exactly like a senior engineer reviews ---
               system_prompt = (
-                  "You are a senior software engineer doing a thorough, file-aware code review. "
-                  "You see ALL changes in a single file at once, just like a real code reviewer would. "
-                  "You respond ONLY with a valid JSON array. "
-                  "No markdown fences, no explanation, no preamble. "
-                  "If there are no issues return exactly: []"
+                  "You are a senior software engineer with 10+ years of experience. "
+                  "You are reviewing a pull request on GitHub. "
+                  "You will receive the unified diff for one file and optionally the full file content. "
+                  "Review the CHANGES (lines starting with +) in the context of the full file. "
+                  "Think like a human reviewer: understand the intent, then find real problems. "
+                  "Respond ONLY with a valid JSON array. No markdown, no explanation. "
+                  "If no issues: []"
               )
 
+              # Build context section
+              context_section = f"## FILE: {filepath}\n"
+              context_section += f"Language: {language} | Total lines: {total_lines} | Lines added: {added_lines}\n\n"
+
+              if full_file:
+                  context_section += "## COMPLETE FILE (with line numbers):\n"
+                  context_section += "```\n" + full_file + "\n```\n\n"
+
+              context_section += "## UNIFIED DIFF (this is what changed in this PR):\n"
+              context_section += "```diff\n" + diff + "\n```\n"
+
               user_prompt = (
-                  f"You are reviewing changes to: {filepath}{part_label}\n"
-                  f"Language: {language}\n"
-                  f"File size: {total_lines} lines total\n"
-                  f"Changes in this review: {len(added_lines)} added lines\n"
-                  "\n"
-                  "You can see ALL changes in this file plus surrounding context.\n"
-                  "Each changed line is marked with >>> and identified by ID:N.\n"
-                  "Context lines are for understanding only — do NOT flag them.\n"
-                  "\n"
-                  "FLAG a line ONLY for genuine objective issues:\n"
-                  "  - Security vulnerabilities (injection, exposed secrets, broken auth)\n"
-                  "  - Bugs causing crashes, data loss, or wrong results\n"
-                  "  - Missing error handling on I/O, network, or DB calls\n"
-                  "  - Race conditions or concurrency bugs\n"
-                  "  - Obvious performance issues (N+1 queries, unbounded loops)\n"
-                  "  - Resource leaks (unclosed files, connections, handles)\n"
-                  "  - Hardcoded secrets or magic values\n"
-                  "  - Null/undefined safety issues — missing checks that will crash at runtime\n"
-                  "\n"
-                  "SINCE YOU SEE THE FULL FILE:\n"
-                  "  - Flag first occurrence of a repeated pattern, mention it applies broadly\n"
-                  "  - If risky in isolation but safe in context, do NOT flag\n"
-                  "\n"
-                  "DO NOT FLAG: style, naming, formatting, architectural opinions,\n"
-                  "issues handled in context, test files (unless definite bug)\n"
-                  "\n"
-                  "OUTPUT — JSON array, each object must have exactly:\n"
-                  '  "id"           : integer from ID:N\n'
-                  '  "comment"      : one sentence — specific problem and exact fix\n'
-                  '  "testable"     : true if this is a null/undefined safety or logic bug '
-                  'that can be proven with a pure function test (no DB/network needed), false otherwise\n'
-                  '  "function_name": the function/method name containing this line, or "" if not in a function\n'
-                  "\n"
-                  'Example: [ {"id": 3, "comment": "...", "testable": true, "function_name": "formatTravelPlan"} ]\n'
-                  "If no issues: []\n"
-                  "\nCHANGES TO REVIEW:\n" + diff_text
+                  context_section + "\n"
+                  "## YOUR TASK\n"
+                  "Review the added lines (starting with +) in the diff above.\n"
+                  "You have the full file for context — use it to understand how changes fit.\n\n"
+                  "FLAG these — they are real problems a senior engineer would block a PR for:\n"
+                  "  1. SECURITY: Hardcoded secrets, credentials, API keys, connection strings in code\n"
+                  "  2. SECURITY: SQL/NoSQL injection, XSS, command injection, path traversal\n"
+                  "  3. SECURITY: Missing authentication/authorization checks\n"
+                  "  4. BUGS: Null/undefined access that WILL crash at runtime\n"
+                  "  5. BUGS: Off-by-one errors, wrong logic operators, unreachable code\n"
+                  "  6. BUGS: Unhandled promise rejections, missing try-catch on I/O/network/DB\n"
+                  "  7. BUGS: Race conditions, shared mutable state without locks\n"
+                  "  8. PERFORMANCE: N+1 queries, unbounded loops, missing pagination\n"
+                  "  9. RESOURCES: Unclosed connections, file handles, event listeners not cleaned up\n"
+                  " 10. DATA: Missing input validation that could corrupt data or crash\n\n"
+                  "DO NOT FLAG:\n"
+                  "  - Style, naming, formatting, spacing\n"
+                  "  - Architectural opinions or preferences\n"
+                  "  - Missing types in JavaScript (unless it causes a real bug)\n"
+                  "  - Test files (unless there is a definite bug IN the test)\n"
+                  "  - Things that are safe in context (check the full file!)\n"
+                  "  - Console.log statements\n\n"
+                  "IMPORTANT RULES:\n"
+                  "  - Only comment on ADDED lines (+ lines in the diff)\n"
+                  f"  - Valid line numbers you can comment on: {valid_lines}\n"
+                  "  - If a pattern repeats, flag the FIRST occurrence and say it applies elsewhere\n"
+                  "  - Each comment must state the EXACT problem and the EXACT fix\n"
+                  "  - Be specific: say 'adminPassword on line 4 is a hardcoded secret' not 'consider using env vars'\n\n"
+                  "OUTPUT — JSON array, each object:\n"
+                  '  "line": integer — must be from the valid line numbers list above\n'
+                  '  "severity": "critical" | "warning"\n'
+                  '  "category": "security" | "bug" | "error-handling" | "performance" | "resource-leak" | "data-validation"\n'
+                  '  "comment": one clear sentence — what is wrong and how to fix it\n'
+                  '  "testable": true if provable with a unit test (pure logic, no DB/network), false otherwise\n'
+                  '  "function_name": function/method containing this line, or "" if top-level\n\n'
+                  'Example:\n'
+                  '[{"line": 4, "severity": "critical", "category": "security", '
+                  '"comment": "adminPassword is hardcoded — move to environment variable using process.env.ADMIN_PASSWORD", '
+                  '"testable": false, "function_name": ""}]\n\n'
+                  "If no real issues: []\n"
               )
 
               payload = {
@@ -397,11 +367,12 @@ jobs:
                       {"role": "system", "content": system_prompt},
                       {"role": "user",   "content": user_prompt}
                   ],
-                  "max_tokens": 2000,
+                  "max_tokens": 3000,
                   "temperature": 0.1
               }
 
-              for attempt in range(3):
+              # Retry with exponential backoff — longer waits for rate limits
+              for attempt in range(4):
                   try:
                       req = urllib.request.Request(
                           "https://api.openai.com/v1/chat/completions",
@@ -419,36 +390,65 @@ jobs:
                       raw = raw.strip()
 
                       file_comments = json.loads(raw)
+
+                      # Validate: only keep comments on valid lines
+                      valid_set = set(valid_lines)
                       resolved = []
                       for c in file_comments:
-                          lid = int(c["id"])
-                          if lid in id_map:
+                          line_num = int(c["line"])
+                          if line_num in valid_set:
                               resolved.append({
-                                  "file":          id_map[lid]["file"],
-                                  "line":          id_map[lid]["line"],
+                                  "file":          filepath,
+                                  "line":          line_num,
+                                  "severity":      c.get("severity", "warning"),
+                                  "category":      c.get("category", "bug"),
                                   "comment":       c["comment"],
                                   "testable":      c.get("testable", False),
                                   "function_name": c.get("function_name", "")
                               })
+                          else:
+                              print(f"  Skipped invalid line {line_num} (not in PR diff)")
+
                       all_comments.extend(resolved)
-                      print(f"  -> {len(resolved)} comments ({sum(1 for r in resolved if r['testable'])} testable)")
+                      critical = sum(1 for r in resolved if r["severity"] == "critical")
+                      warning = sum(1 for r in resolved if r["severity"] == "warning")
+                      print(f"  -> {len(resolved)} comments ({critical} critical, {warning} warning)")
                       break
 
                   except Exception as e:
-                      print(f"  Attempt {attempt+1} failed: {e}")
-                      if attempt < 2:
+                      err_str = str(e)
+                      print(f"  Attempt {attempt+1} failed: {err_str}")
+                      if "429" in err_str:
+                          # Rate limit — wait longer: 15s, 30s, 60s, then give up
+                          wait = [15, 30, 60, 0][attempt]
+                          if wait > 0:
+                              print(f"  Rate limited. Waiting {wait}s before retry...")
+                              time.sleep(wait)
+                          else:
+                              print(f"  Skipping {filepath} after 4 rate-limit retries")
+                      elif attempt < 3:
                           wait = 2 ** attempt
                           print(f"  Retrying in {wait}s...")
                           time.sleep(wait)
                       else:
-                          print(f"  Skipping {filepath} after 3 attempts")
+                          print(f"  Skipping {filepath} after 4 attempts")
 
-              if idx < len(chunks) - 1:
-                  time.sleep(1)
+              # Small delay between files to avoid rate limits
+              if idx < len(packages) - 1:
+                  time.sleep(3)
 
           with open("line_comments.json", "w") as f:
               json.dump(all_comments, f, indent=2)
+
+          # Also save packages info for summary step
+          with open("diff_chunks.json", "w") as f:
+              json.dump([{"file": p["file"], "lines": [{"line": l} for l in range(p["added_lines"])]}
+                        for p in packages], f)
+
           print(f"\nTotal comments: {len(all_comments)}")
+          crit = sum(1 for c in all_comments if c["severity"] == "critical")
+          warn = sum(1 for c in all_comments if c["severity"] == "warning")
+          print(f"  Critical: {crit}, Warning: {warn}")
           EOF
 
       # Step 8: Apply PR labels based on review results
@@ -524,14 +524,16 @@ jobs:
           with open("line_comments.json", "r") as f:
               comments = json.load(f)
 
-          with open("diff_chunks.json", "r") as f:
-              chunks = json.load(f)
+          with open("review_packages.json", "r") as f:
+              packages = json.load(f)
 
           total_issues = len(comments)
           testable = sum(1 for c in comments if c.get("testable", False))
+          critical = sum(1 for c in comments if c.get("severity") == "critical")
+          warning = sum(1 for c in comments if c.get("severity") == "warning")
           non_testable = total_issues - testable
-          files_reviewed = len(chunks)
-          total_lines = sum(len(c["lines"]) for c in chunks)
+          files_reviewed = len(packages)
+          total_lines = sum(p["added_lines"] for p in packages)
           files_with_issues = len(set(c["file"] for c in comments)) if comments else 0
           clean_files = files_reviewed - files_with_issues
 
@@ -540,14 +542,14 @@ jobs:
               status_icon = "✅"
               status_text = "No issues found — code looks clean!"
               verdict = "CLEAN"
-          elif testable > 0:
+          elif critical > 0:
               status_icon = "🔴"
-              status_text = f"Found **{total_issues} issue(s)** — {testable} testable bug(s) detected"
-              verdict = "ISSUES FOUND"
+              status_text = f"Found **{critical} critical** and **{warning} warning** issue(s) — immediate fixes needed"
+              verdict = "CRITICAL ISSUES"
           else:
               status_icon = "🟡"
-              status_text = f"Found **{total_issues} issue(s)** to review"
-              verdict = "ISSUES FOUND"
+              status_text = f"Found **{total_issues} warning(s)** to review"
+              verdict = "WARNINGS"
 
           # Build file breakdown
           file_breakdown = ""
@@ -571,9 +573,12 @@ jobs:
           if comments:
               findings = "\n### 🔍 Findings Detail\n\n"
               for i, c in enumerate(comments, 1):
-                  test_badge = "🧪 Testable" if c.get("testable", False) else "👁️ Review"
+                  sev = "🔴 Critical" if c.get("severity") == "critical" else "🟡 Warning"
+                  cat = c.get("category", "bug")
+                  test_tag = " | 🧪 Testable" if c.get("testable", False) else ""
                   func = f" in `{c['function_name']}()`" if c.get("function_name") else ""
-                  findings += f"**{i}.** `{c['file']}` line {c['line']}{func} — {test_badge}\n"
+                  findings += f"**{i}.** `{c['file']}` line {c['line']}{func}\n"
+                  findings += f"   {sev} | `{cat}`{test_tag}\n"
                   findings += f"   > {c['comment']}\n\n"
 
           body = (
@@ -585,8 +590,9 @@ jobs:
               f"| Files reviewed | {files_reviewed} |\n"
               f"| Lines analyzed | {total_lines} |\n"
               f"| Total issues | {total_issues} |\n"
+              f"| Critical | {critical} |\n"
+              f"| Warning | {warning} |\n"
               f"| Testable bugs | {testable} |\n"
-              f"| Review-only | {non_testable} |\n"
               f"| Clean files | {clean_files}/{files_reviewed} |\n"
               f"{file_breakdown}{findings}\n"
               f"---\n"
