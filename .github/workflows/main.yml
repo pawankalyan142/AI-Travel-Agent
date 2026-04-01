@@ -11,7 +11,8 @@ env:
 
 permissions:
   pull-requests: write
-  contents: read
+  contents: write
+  issues: write
 
 jobs:
   ai-code-review:
@@ -23,6 +24,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       # Step 2: Check if AI already reviewed this PR
       - name: Check if AI already reviewed this PR
@@ -53,7 +55,7 @@ jobs:
           print(f"Already reviewed: {already_reviewed}")
           EOF
 
-      # Step 3: Stop if already reviewed
+      # Step 3: Stop if already reviewed — apply label
       - name: Post already reviewed comment and stop
         if: steps.check_reviewed.outputs.already_reviewed == 'true'
         env:
@@ -65,7 +67,7 @@ jobs:
             -H "Authorization: Bearer $GITHUB_TOKEN" \
             -H "Content-Type: application/json" \
             "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments" \
-            -d "{\"body\": \"## \u2139\ufe0f AI Review Already Done\n\n\u2705 AI has already reviewed this PR once. No further AI reviews will run.\n\n**Next step:** Please fix the AI comments and request a **peer review** from your teammates.\"}"
+            -d "{\"body\": \"## ℹ️ AI Review Already Done\n\n✅ AI has already reviewed this PR once. No further AI reviews will run.\n\n**Next step:** Please fix the AI comments and request a **peer review** from your teammates.\"}"
 
       # Step 4: Get diff and validate size
       - name: Get PR diff and validate size
@@ -88,19 +90,55 @@ jobs:
             echo "too_large=false" >> $GITHUB_OUTPUT
           fi
 
-      # Step 5: Hard stop if PR too large
-      - name: Comment PR too large and exit
+      # Step 5: Hard stop if PR too large — apply label
+      - name: Comment PR too large and label
         if: steps.check_reviewed.outputs.already_reviewed == 'false' && steps.validate_diff.outputs.too_large == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
+          # Post comment
           curl -s -X POST \
             -H "Authorization: Bearer $GITHUB_TOKEN" \
             -H "Content-Type: application/json" \
             "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments" \
-            -d "{\"body\": \"## \u26a0\ufe0f AI Code Review Skipped\n\n**Reason:** This PR has **${{ steps.validate_diff.outputs.total_lines }} added lines** which exceeds the limit of 1000 lines.\n\n**Please split this PR into smaller focused PRs.**\"}"
+            -d "{\"body\": \"## ⚠️ AI Code Review Skipped\n\n**Reason:** This PR has **${{ steps.validate_diff.outputs.total_lines }} added lines** which exceeds the limit of 1000 lines.\n\n**Please split this PR into smaller focused PRs.**\"}"
+
+          # Apply label: ai:skipped-too-large
+          python3 << 'LABEL_EOF'
+          import urllib.request, json, os
+          token = os.environ["GITHUB_TOKEN"]
+          repo = os.environ["REPO"]
+          pr = os.environ["PR_NUMBER"]
+
+          def ensure_label(name, color, description):
+              """Create label if it doesn't exist"""
+              try:
+                  data = json.dumps({"name": name, "color": color, "description": description}).encode()
+                  req = urllib.request.Request(
+                      f"https://api.github.com/repos/{repo}/labels",
+                      data=data,
+                      headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+                  )
+                  urllib.request.urlopen(req)
+              except Exception:
+                  pass  # label already exists
+
+          def apply_label(name):
+              data = json.dumps({"labels": [name]}).encode()
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{repo}/issues/{pr}/labels",
+                  data=data,
+                  headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+              )
+              urllib.request.urlopen(req)
+
+          ensure_label("ai:skipped-too-large", "FFC107", "PR too large for AI review")
+          apply_label("ai:skipped-too-large")
+          print("Label applied: ai:skipped-too-large")
+          LABEL_EOF
+
           exit 0
 
       # Step 6: Build valid lines from GitHub API + file-level chunks
@@ -413,424 +451,201 @@ jobs:
           print(f"\nTotal comments: {len(all_comments)}")
           EOF
 
-      # Step 8: Generate and run unit tests for testable findings
-      #
-      # PHASE 1 TEST GENERATION — Design decisions:
-      #
-      # 1. TOKEN BUDGET: max 5 findings get tests (most testable ones first)
-      #    One OpenAI call per finding — but we send ONLY the function body,
-      #    not the whole file. Keeps tokens low.
-      #
-      # 2. NO FRAMEWORK: we use plain `node` for JS/TS and `python3` for Python.
-      #    Zero npm install. Zero setup. Runs in seconds.
-      #    For TS files we strip types with a simple regex — good enough for
-      #    pure function testing without a full TypeScript compiler.
-      #
-      # 3. TEST DESIGN RULE: AI must write tests that FAIL on buggy code.
-      #    Not happy-path tests. Tests that expose the exact flagged weakness.
-      #
-      # 4. RESULT: each finding gets a verdict — CONFIRMED (test failed = bug real)
-      #    or UNCONFIRMED (test passed = may be false positive)
-      - name: Generate and run unit tests for testable findings
-        if: steps.check_reviewed.outputs.already_reviewed == 'false' && steps.validate_diff.outputs.too_large == 'false'
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: |
-          python3 << 'EOF'
-          import json, urllib.request, os, subprocess, re, time
-
-          with open("line_comments.json") as f:
-              all_comments = json.load(f)
-
-          api_key = os.environ["OPENAI_API_KEY"]
-
-          # --- Pick up to 5 testable findings (JS/TS/Python only for Phase 1) ---
-          TESTABLE_EXTS = {".js", ".ts", ".tsx", ".jsx", ".py"}
-
-          testable = [
-              c for c in all_comments
-              if c.get("testable") and
-                 c.get("function_name") and
-                 any(c["file"].endswith(ext) for ext in TESTABLE_EXTS)
-          ][:5]   # hard cap — token budget
-
-          print(f"Testable findings selected: {len(testable)} of {len(all_comments)} total")
-
-          test_results = []
-
-          for finding in testable:
-              filepath      = finding["file"]
-              line_num      = finding["line"]
-              comment       = finding["comment"]
-              function_name = finding["function_name"]
-              is_python     = filepath.endswith(".py")
-              is_ts         = filepath.endswith((".ts", ".tsx"))
-
-              print(f"\nGenerating test for: {function_name}() in {filepath} line {line_num}")
-
-              # --- Extract the function body from the actual file ---
-              function_code = ""
-              if os.path.exists(filepath):
-                  with open(filepath, "r", errors="ignore") as f:
-                      source = f.read()
-
-                  # Simple extraction: find the function and grab ~40 lines
-                  # Handles: function foo(), const foo = (), foo() {}, async foo()
-                  patterns = [
-                      rf'((?:export\s+)?(?:async\s+)?function\s+{re.escape(function_name)}\s*\([^)]*\)[^{{]*{{)',
-                      rf'((?:export\s+)?(?:const|let|var)\s+{re.escape(function_name)}\s*=\s*(?:async\s+)?(?:\([^)]*\)|[^=]+)\s*=>)',
-                      rf'((?:async\s+)?{re.escape(function_name)}\s*\([^)]*\)\s*(?::\s*\w+)?\s*{{)',
-                  ]
-                  start_idx = -1
-                  for pattern in patterns:
-                      m = re.search(pattern, source)
-                      if m:
-                          start_idx = m.start()
-                          break
-
-                  if start_idx >= 0:
-                      # Grab from function start, take up to 50 lines
-                      snippet = source[start_idx:]
-                      lines = snippet.split("\n")[:50]
-                      function_code = "\n".join(lines)
-                  else:
-                      # Fallback: grab 30 lines around the flagged line
-                      all_lines = source.split("\n")
-                      start = max(0, line_num - 15)
-                      end   = min(len(all_lines), line_num + 15)
-                      function_code = "\n".join(all_lines[start:end])
-
-              if not function_code.strip():
-                  print(f"  Could not extract function code — skipping")
-                  continue
-
-              # --- Ask AI to generate tests ---
-              # Key constraint: send ONLY the function, not the whole file
-              # This is what keeps token usage low
-              lang_label = "Python" if is_python else "TypeScript/JavaScript"
-
-              test_prompt = (
-                  f"You are generating a unit test to PROVE a bug exists in this {lang_label} function.\n\n"
-                  f"FUNCTION:\n```\n{function_code}\n```\n\n"
-                  f"BUG REPORTED: {comment}\n\n"
-                  "Write 2-3 test cases as a self-contained executable script.\n"
-                  "CRITICAL RULES:\n"
-                  "  1. Tests must target the EXACT weakness described above\n"
-                  "  2. Tests should FAIL on the current buggy code and PASS after fix\n"
-                  "  3. Use only plain values — no mocks, no frameworks, no imports\n"
-                  "     For JS/TS: copy the function inline, use console.log PASS/FAIL\n"
-                  "     For Python: copy the function inline, use print PASS/FAIL\n"
-                  "  4. Each test must print exactly: 'PASS: <description>' or 'FAIL: <description> | Error: <msg>'\n"
-                  "  5. Wrap each test in try/catch (JS) or try/except (Python)\n"
-                  "  6. Script must NOT crash — catch all errors and report FAIL\n"
-                  "  7. Do NOT use import, require, or any external dependency\n"
-                  "  8. Copy the function definition inline into the script\n\n"
-                  "Return ONLY the raw executable script. No markdown, no explanation.\n"
-              )
-
-              payload = {
-                  "model": "gpt-4o",
-                  "messages": [
-                      {"role": "system", "content": "You are a test engineer. Return only raw executable code. No markdown."},
-                      {"role": "user",   "content": test_prompt}
-                  ],
-                  "max_tokens": 800,   # tight budget — just the test script
-                  "temperature": 0.1
-              }
-
-              test_script = ""
-              for attempt in range(2):
-                  try:
-                      req = urllib.request.Request(
-                          "https://api.openai.com/v1/chat/completions",
-                          data=json.dumps(payload).encode(),
-                          headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
-                      )
-                      with urllib.request.urlopen(req) as response:
-                          data = json.loads(response.read())
-                      test_script = data["choices"][0]["message"]["content"].strip()
-                      # Strip markdown fences if model disobeys
-                      if test_script.startswith("```"):
-                          lines = test_script.split("\n")
-                          test_script = "\n".join(lines[1:])
-                      if test_script.endswith("```"):
-                          lines = test_script.split("\n")
-                          test_script = "\n".join(lines[:-1])
-                      test_script = test_script.strip()
-                      break
-                  except Exception as e:
-                      print(f"  Test gen attempt {attempt+1} failed: {e}")
-                      time.sleep(1)
-
-              if not test_script:
-                  print(f"  Test generation failed — skipping")
-                  continue
-
-              # --- Run the test script ---
-              script_file = f"test_finding_{line_num}.{'py' if is_python else 'js'}"
-              with open(script_file, "w") as f:
-                  f.write(test_script)
-
-              runner = "python3" if is_python else "node"
-              try:
-                  result = subprocess.run(
-                      [runner, script_file],
-                      capture_output=True, text=True, timeout=15
-                  )
-                  output = result.stdout + result.stderr
-              except subprocess.TimeoutExpired:
-                  output = "TIMEOUT: test took more than 15 seconds"
-              except Exception as e:
-                  output = f"RUNNER ERROR: {e}"
-
-              print(f"  Test output:\n{output}")
-
-              # --- Parse results ---
-              pass_lines = [l for l in output.split("\n") if l.strip().startswith("PASS")]
-              fail_lines = [l for l in output.split("\n") if l.strip().startswith("FAIL")]
-
-              passed = len(pass_lines)
-              failed = len(fail_lines)
-
-              # A finding is CONFIRMED if at least one test failed
-              # (meaning the bug actually exists and the test caught it)
-              status = "CONFIRMED" if failed > 0 else "UNCONFIRMED"
-
-              test_results.append({
-                  "file":          filepath,
-                  "line":          line_num,
-                  "function_name": function_name,
-                  "comment":       comment,
-                  "status":        status,
-                  "passed":        passed,
-                  "failed":        failed,
-                  "pass_lines":    pass_lines,
-                  "fail_lines":    fail_lines,
-                  "script":        test_script
-              })
-
-              print(f"  -> {status}: {passed} passed, {failed} failed")
-              time.sleep(1)  # small delay between OpenAI calls
-
-          with open("test_results.json", "w") as f:
-              json.dump(test_results, f, indent=2)
-          print(f"\nTest generation complete: {len(test_results)} functions tested")
-          EOF
-
-      # Step 9: Post comments — two-tier, zero lost
-      - name: Post comments (inline + fallback for out-of-diff lines)
-        if: steps.check_reviewed.outputs.already_reviewed == 'false' && steps.validate_diff.outputs.too_large == 'false'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
-          PR_COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          python3 << 'EOF'
-          import json, urllib.request, urllib.error, os
-
-          with open("line_comments.json", "r") as f:
-              comments = json.load(f)
-          with open("valid_lines.json", "r") as f:
-              valid_list = json.load(f)
-          with open("test_results.json", "r") as f:
-              test_results = json.load(f)
-
-          # Build a lookup so we can append test results to the right comment
-          test_lookup = {(t["file"], t["line"]): t for t in test_results}
-
-          valid = {(e["file"], e["line"]) for e in valid_list}
-
-          token      = os.environ["GITHUB_TOKEN"]
-          repo       = os.environ["REPO"]
-          pr_number  = os.environ["PR_NUMBER"]
-          commit_sha = os.environ["PR_COMMIT_SHA"]
-
-          posted   = 0
-          fallback = []
-
-          for item in comments:
-              key = (item["file"], item["line"])
-
-              # Build comment body — append test result if available
-              body = f"\U0001f916 **AI Review:** {item['comment']}"
-
-              if key in test_lookup:
-                  t = test_lookup[key]
-                  if t["status"] == "CONFIRMED":
-                      body += f"\n\n**\U0001f9ea Test Result: \U0001f534 BUG CONFIRMED**\n"
-                      body += f"Ran `{t['function_name']}()` with edge case inputs — {t['failed']} test(s) failed:\n"
-                      for fl in t["fail_lines"][:3]:
-                          body += f"- `{fl.strip()}`\n"
-                      if t["passed"] > 0:
-                          body += f"\n{t['passed']} test(s) passed. Fix the failing cases above."
-                  else:
-                      body += f"\n\n**\U0001f9ea Test Result: \u2705 UNCONFIRMED**\n"
-                      body += f"Ran `{t['function_name']}()` with edge case inputs — all {t['passed']} test(s) passed.\n"
-                      body += "This finding may not apply to your current code — review manually."
-
-              if key not in valid:
-                  fallback.append({"body": body, "file": item["file"], "line": item["line"]})
-                  print(f"Queued for fallback: {item['file']} line {item['line']}")
-                  continue
-
-              payload = {
-                  "body":      body,
-                  "commit_id": commit_sha,
-                  "path":      item["file"],
-                  "line":      item["line"],
-                  "side":      "RIGHT"
-              }
-              req = urllib.request.Request(
-                  f"https://api.github.com/repos/{repo}/pulls/{pr_number}/comments",
-                  data=json.dumps(payload).encode(),
-                  headers={
-                      "Authorization": f"Bearer {token}",
-                      "Content-Type": "application/json",
-                      "Accept": "application/vnd.github.v3+json"
-                  }
-              )
-              try:
-                  with urllib.request.urlopen(req) as r:
-                      if r.status == 201:
-                          posted += 1
-                          print(f"Inline: {item['file']} @ {item['line']}")
-              except urllib.error.HTTPError as e:
-                  fallback.append({"body": body, "file": item["file"], "line": item["line"]})
-                  print(f"Recovered to fallback: {item['file']} line {item['line']}: {e.read().decode()}")
-
-          if fallback:
-              body_lines = [
-                  "\U0001f916 **AI Review \u2014 Additional Findings**\n",
-                  "The following issues could not be posted inline (outside the diff view):\n"
-              ]
-              for item in fallback:
-                  body_lines.append(f"- **`{item['file']}` line {item['line']}:** {item['body']}")
-              req = urllib.request.Request(
-                  f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments",
-                  data=json.dumps({"body": "\n".join(body_lines)}).encode(),
-                  headers={
-                      "Authorization": f"Bearer {token}",
-                      "Content-Type": "application/json",
-                      "Accept": "application/vnd.github.v3+json"
-                  }
-              )
-              with urllib.request.urlopen(req) as r:
-                  print(f"Fallback comment posted ({len(fallback)} items): {r.status}")
-
-          with open("posting_stats.json", "w") as f:
-              json.dump({"inline": posted, "fallback": len(fallback)}, f)
-
-          print(f"\nSummary: {posted} inline, {len(fallback)} fallback \u2014 0 lost")
-          EOF
-
-      # Step 10: Add ai-reviewed label
-      - name: Add ai-reviewed label
+      # Step 8: Apply PR labels based on review results
+      - name: Apply PR labels based on review results
         if: steps.check_reviewed.outputs.already_reviewed == 'false' && steps.validate_diff.outputs.too_large == 'false'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
-          curl -s -X POST \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "Content-Type: application/json" \
-            "https://api.github.com/repos/$REPO/labels" \
-            -d '{"name":"ai-reviewed","color":"7057ff","description":"AI code review completed"}' || true
-          curl -s -X POST \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "Content-Type: application/json" \
-            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/labels" \
-            -d '{"labels":["ai-reviewed"]}'
-          echo "Label ai-reviewed applied"
-
-      # Step 11: Post final summary with test results breakdown
-      - name: Post summary comment
-        if: steps.check_reviewed.outputs.already_reviewed == 'false' && steps.validate_diff.outputs.too_large == 'false'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
-          TOTAL_LINES: ${{ steps.validate_diff.outputs.total_lines }}
-        run: |
           python3 << 'EOF'
-          import json, os, urllib.request
-
-          with open("posting_stats.json") as f:
-              stats = json.load(f)
-          with open("diff_chunks.json") as f:
-              chunks = json.load(f)
-          with open("line_comments.json") as f:
-              comments = json.load(f)
-          with open("test_results.json") as f:
-              test_results = json.load(f)
-
-          inline   = stats["inline"]
-          fallback = stats["fallback"]
-          total    = inline + fallback
-
-          # Per-file comment counts
-          file_summary = {}
-          for c in comments:
-              file_summary[c["file"]] = file_summary.get(c["file"], 0) + 1
-          files_reviewed = len({c["file"] for c in chunks})
-
-          file_rows = ""
-          for filepath, count in sorted(file_summary.items()):
-              file_rows += f"| `{filepath}` | {count} |\n"
-          if not file_rows:
-              file_rows = "| \u2014 | 0 |\n"
-
-          # Test results summary
-          confirmed   = [t for t in test_results if t["status"] == "CONFIRMED"]
-          unconfirmed = [t for t in test_results if t["status"] == "UNCONFIRMED"]
-
-          test_section = ""
-          if test_results:
-              test_section = "\n**\U0001f9ea AI-Generated Test Results:**\n\n"
-              test_section += "| Function | File | Tests | Result |\n|---|---|---|---|\n"
-              for t in test_results:
-                  result_icon = "\U0001f534 Bug Confirmed" if t["status"] == "CONFIRMED" else "\u2705 Unconfirmed"
-                  test_section += f"| `{t['function_name']}()` | `{t['file']}` | {t['passed']}P / {t['failed']}F | {result_icon} |\n"
-
-              if confirmed:
-                  test_section += f"\n> \U0001f534 **{len(confirmed)} finding(s) confirmed** by failing tests — these are real bugs, fix them before merge.\n"
-              if unconfirmed:
-                  test_section += f"> \u2705 **{len(unconfirmed)} finding(s) unconfirmed** — tests passed, review manually.\n"
-
-          fallback_note = (
-              f"\n> \U0001f4dd **{fallback} finding(s)** outside diff view \u2014 see Additional Findings comment above."
-              if fallback > 0 else ""
-          )
-
-          body = (
-              "\U0001f916 **AI Code Review Complete**\n\n"
-              "| | |\n|---|---|\n"
-              f"| Files reviewed | {files_reviewed} |\n"
-              f"| Lines reviewed | {os.environ.get('TOTAL_LINES', '?')} |\n"
-              f"| Inline comments | {inline} |\n"
-              f"| Fallback comments | {fallback} |\n"
-              f"| Total findings | {total} |\n"
-              f"| Tests generated | {len(test_results)} |\n"
-              f"| Bugs confirmed | {len(confirmed)} |\n"
-              "| Label | `ai-reviewed` |\n"
-              "\n**Findings by file:**\n\n"
-              "| File | Comments |\n|---|---|\n"
-              + file_rows
-              + test_section
-              + fallback_note
-              + "\n\n\u26a0\ufe0f **AI review is a one-time pass. Fix confirmed bugs first, "
-              "then address other comments, then request peer review. AI will not review this PR again.**"
-          )
+          import json, urllib.request, os
 
           token = os.environ["GITHUB_TOKEN"]
           repo = os.environ["REPO"]
-          pr_number = os.environ["PR_NUMBER"]
-          req = urllib.request.Request(
-              f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments",
-              data=json.dumps({"body": body}).encode(),
-              headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/vnd.github.v3+json"}
-          )
-          with urllib.request.urlopen(req) as r:
-              print(f"Summary posted: {r.status}")
+          pr = os.environ["PR_NUMBER"]
+
+          with open("line_comments.json", "r") as f:
+              comments = json.load(f)
+
+          def ensure_label(name, color, description):
+              try:
+                  data = json.dumps({"name": name, "color": color, "description": description}).encode()
+                  req = urllib.request.Request(
+                      f"https://api.github.com/repos/{repo}/labels",
+                      data=data,
+                      headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+                  )
+                  urllib.request.urlopen(req)
+                  print(f"Created label: {name}")
+              except Exception:
+                  pass  # already exists
+
+          def apply_label(name):
+              data = json.dumps({"labels": [name]}).encode()
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{repo}/issues/{pr}/labels",
+                  data=data,
+                  headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+              )
+              urllib.request.urlopen(req)
+              print(f"Applied label: {name}")
+
+          # Ensure all AI labels exist
+          ensure_label("ai:clean",            "0E8A16", "AI review found no issues")
+          ensure_label("ai:issues-found",     "D93F0B", "AI review found issues to fix")
+          ensure_label("ai:has-testable-bugs","B60205", "AI found bugs confirmable by auto-tests")
+
+          total = len(comments)
+          testable = sum(1 for c in comments if c.get("testable", False))
+
+          if total == 0:
+              apply_label("ai:clean")
+              print("No issues found — PR is clean")
+          else:
+              apply_label("ai:issues-found")
+              if testable > 0:
+                  apply_label("ai:has-testable-bugs")
+              print(f"Issues found: {total} total, {testable} testable")
           EOF
+
+      # Step 9: Update metrics badge JSON and commit
+      - name: Update AI review metrics badge
+        if: steps.check_reviewed.outputs.already_reviewed == 'false' && steps.validate_diff.outputs.too_large == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 << 'EOF'
+          import json, os, datetime
+
+          with open("line_comments.json", "r") as f:
+              comments = json.load(f)
+
+          total_issues = len(comments)
+          testable = sum(1 for c in comments if c.get("testable", False))
+          files_reviewed = len(set(c["file"] for c in comments)) if comments else 0
+
+          # --- Load or initialize cumulative metrics ---
+          metrics_file = ".ai-review/metrics.json"
+          os.makedirs(".ai-review", exist_ok=True)
+
+          if os.path.exists(metrics_file):
+              with open(metrics_file, "r") as f:
+                  metrics = json.load(f)
+          else:
+              metrics = {
+                  "total_prs_reviewed": 0,
+                  "total_issues_found": 0,
+                  "total_testable_bugs": 0,
+                  "total_clean_prs": 0,
+                  "history": []
+              }
+
+          # --- Update cumulative metrics ---
+          metrics["total_prs_reviewed"] += 1
+          metrics["total_issues_found"] += total_issues
+          metrics["total_testable_bugs"] += testable
+          if total_issues == 0:
+              metrics["total_clean_prs"] += 1
+
+          # Add this PR to history
+          metrics["history"].append({
+              "pr": int(os.environ["PR_NUMBER"]),
+              "date": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+              "issues": total_issues,
+              "testable": testable,
+              "files": files_reviewed
+          })
+
+          # Keep last 100 entries only
+          metrics["history"] = metrics["history"][-100:]
+
+          with open(metrics_file, "w") as f:
+              json.dump(metrics, f, indent=2)
+
+          # --- Generate Shields.io badge JSONs ---
+          total_prs = metrics["total_prs_reviewed"]
+          total_bugs = metrics["total_issues_found"]
+          clean_prs = metrics["total_clean_prs"]
+          confirmed = metrics["total_testable_bugs"]
+
+          # Badge 1: PRs Reviewed
+          with open(".ai-review/badge-prs-reviewed.json", "w") as f:
+              json.dump({
+                  "schemaVersion": 1,
+                  "label": "AI Reviewed PRs",
+                  "message": str(total_prs),
+                  "color": "blue"
+              }, f)
+
+          # Badge 2: Issues Found
+          with open(".ai-review/badge-issues-found.json", "w") as f:
+              json.dump({
+                  "schemaVersion": 1,
+                  "label": "AI Issues Found",
+                  "message": str(total_bugs),
+                  "color": "orange" if total_bugs > 0 else "green"
+              }, f)
+
+          # Badge 3: Clean PR Rate
+          clean_rate = f"{round(clean_prs / total_prs * 100)}%" if total_prs > 0 else "N/A"
+          color = "brightgreen" if total_prs > 0 and (clean_prs / total_prs) >= 0.7 else "yellow"
+          with open(".ai-review/badge-clean-rate.json", "w") as f:
+              json.dump({
+                  "schemaVersion": 1,
+                  "label": "Clean PR Rate",
+                  "message": clean_rate,
+                  "color": color
+              }, f)
+
+          # Badge 4: Testable Bugs Confirmed
+          with open(".ai-review/badge-testable-bugs.json", "w") as f:
+              json.dump({
+                  "schemaVersion": 1,
+                  "label": "Testable Bugs",
+                  "message": str(confirmed),
+                  "color": "red" if confirmed > 0 else "brightgreen"
+              }, f)
+
+          print(f"Metrics updated: {total_prs} PRs, {total_bugs} issues, {clean_rate} clean rate")
+          EOF
+
+          # --- Commit badge files to ai-metrics branch ---
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Save generated files before switching branch
+          cp -r .ai-review /tmp/.ai-review-backup
+
+          # Switch to ai-metrics branch (fetch it or create orphan if first run)
+          git fetch origin ai-metrics || true
+          if git rev-parse --verify origin/ai-metrics >/dev/null 2>&1; then
+            git checkout ai-metrics
+          else
+            git checkout --orphan ai-metrics
+            git rm -rf . 2>/dev/null || true
+            git commit --allow-empty -m "init: ai-metrics branch for AI review badges"
+          fi
+
+          # Copy badge files into this branch
+          cp -r /tmp/.ai-review-backup .ai-review
+          git add .ai-review/
+
+          if git diff --cached --quiet; then
+            echo "No badge changes to commit"
+          else
+            git commit -m "chore: update AI review metrics — PR #$PR_NUMBER [skip ci]"
+            git push origin ai-metrics
+            echo "Badges committed and pushed to ai-metrics branch"
+          fi
+
+      # NOTE: Add the following to your README.md to display badges:
+      # Replace YOUR_ORG/YOUR_REPO with your actual repo path
+      #
+      # ![AI Reviewed PRs](https://img.shields.io/badge/dynamic/json?url=https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/ai-metrics/.ai-review/badge-prs-reviewed.json&query=message&label=AI%20Reviewed%20PRs&color=blue)
+      # ![AI Issues Found](https://img.shields.io/badge/dynamic/json?url=https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/ai-metrics/.ai-review/badge-issues-found.json&query=message&label=AI%20Issues%20Found&color=orange)
+      # ![Clean PR Rate](https://img.shields.io/badge/dynamic/json?url=https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/ai-metrics/.ai-review/badge-clean-rate.json&query=message&label=Clean%20PR%20Rate&color=brightgreen)
+      # ![Testable Bugs](https://img.shields.io/badge/dynamic/json?url=https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/ai-metrics/.ai-review/badge-testable-bugs.json&query=message&label=Testable%20Bugs&color=red)
