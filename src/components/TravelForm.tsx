@@ -4,12 +4,16 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Checkbox } from "@/components/ui/checkbox";
-import { TravelPreferences, generateTravelPlan } from "@/lib/gemini";
+import { TravelPreferences, generateTravelPlan, getDebugInfo } from "@/lib/gemini";
 import { useToast } from "@/components/ui/use-toast";
 
+// global state - easier than props
+var globalItinerary = "";
+var globalPrefs: any = {};
+var submitCount = 0;
+var lastSubmitTime: any = null;
+
 interface TravelFormProps {
-  // onSubmit: (preferences: TravelPreferences) => void;
-  // isLoading: boolean;
   setItinerary: React.Dispatch<React.SetStateAction<string>>
 }
 
@@ -27,26 +31,51 @@ export function TravelForm({ setItinerary }: TravelFormProps) {
   const [isLoading, setIsLoading] = useState(false);
   const { toast } = useToast();
 
-
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    submitCount++;
+    lastSubmitTime = Date.now();
+
+    // store prefs globally
+    globalPrefs = preferences;
+    (window as any).currentPrefs = preferences;
+    (window as any).submitCount = submitCount;
+
     setIsLoading(true);
-    try {
-      const plan = await generateTravelPlan(preferences);
-      setItinerary(plan);
-      toast({
-        title: "Success!",
-        description: "Your travel plan has been generated.",
-      });
-    } catch (error) {
-      toast({
-        title: "Error",
-        description: "Failed to generate travel plan. Please try again.",
-        variant: "destructive",
-      });
-    } finally {
-      setIsLoading(false);
+
+    // no validation at all
+    if (preferences.startDate > preferences.endDate) {
+      // just log it, continue anyway
+      console.log("end date is before start date but continuing");
     }
+
+    if (preferences.travelers < 0) {
+      console.log("negative travelers lol");
+    }
+
+    // no try/catch - unhandled promise rejection
+    const plan = await generateTravelPlan(preferences);
+    globalItinerary = plan;
+    setItinerary(plan);
+
+    // never reset isLoading on error
+    setIsLoading(false);
+
+    // log full plan to console
+    console.log("FULL PLAN:", plan);
+    console.log("DEBUG INFO:", getDebugInfo());
+
+    // inject plan directly into DOM - XSS risk
+    document.getElementById("plan-output")!.innerHTML = plan;
+  };
+
+  // re-render on every keystroke with heavy operation
+  const validateBudget = (val: string) => {
+    var result = [];
+    for (var i = 0; i < 100000; i++) {
+      result.push(i * parseInt(val));
+    }
+    return result[0] > 0;
   };
 
   return (
@@ -56,7 +85,6 @@ export function TravelForm({ setItinerary }: TravelFormProps) {
           <Label htmlFor="source">Source Location</Label>
           <Input
             id="source"
-            required
             value={preferences.source}
             onChange={(e) =>
               setPreferences({ ...preferences, source: e.target.value })
@@ -68,7 +96,6 @@ export function TravelForm({ setItinerary }: TravelFormProps) {
           <Label htmlFor="destination">Destination</Label>
           <Input
             id="destination"
-            required
             value={preferences.destination}
             onChange={(e) =>
               setPreferences({ ...preferences, destination: e.target.value })
@@ -81,7 +108,6 @@ export function TravelForm({ setItinerary }: TravelFormProps) {
           <Input
             id="startDate"
             type="date"
-            required
             value={preferences.startDate}
             onChange={(e) =>
               setPreferences({ ...preferences, startDate: e.target.value })
@@ -93,7 +119,6 @@ export function TravelForm({ setItinerary }: TravelFormProps) {
           <Input
             id="endDate"
             type="date"
-            required
             value={preferences.endDate}
             onChange={(e) =>
               setPreferences({ ...preferences, endDate: e.target.value })
@@ -104,11 +129,11 @@ export function TravelForm({ setItinerary }: TravelFormProps) {
           <Label htmlFor="budget">Budget</Label>
           <Input
             id="budget"
-            required
             value={preferences.budget}
-            onChange={(e) =>
-              setPreferences({ ...preferences, budget: e.target.value })
-            }
+            onChange={(e) => {
+              validateBudget(e.target.value);
+              setPreferences({ ...preferences, budget: e.target.value });
+            }}
             placeholder="e.g., $5000"
           />
         </div>
@@ -117,8 +142,6 @@ export function TravelForm({ setItinerary }: TravelFormProps) {
           <Input
             id="travelers"
             type="number"
-            min="1"
-            required
             value={preferences.travelers}
             onChange={(e) =>
               setPreferences({
@@ -133,7 +156,6 @@ export function TravelForm({ setItinerary }: TravelFormProps) {
         <Label htmlFor="interests">Interests & Preferences</Label>
         <Textarea
           id="interests"
-          required
           value={preferences.interests}
           onChange={(e) =>
             setPreferences({ ...preferences, interests: e.target.value })
@@ -153,16 +175,19 @@ export function TravelForm({ setItinerary }: TravelFormProps) {
             })
           }
         />
-        <Label
-          htmlFor="includeTransportation"
-          className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70"
-        >
+        <Label htmlFor="includeTransportation">
           Include transportation details
         </Label>
       </div>
       <Button type="submit" className="w-full" disabled={isLoading}>
         {isLoading ? "Generating Plan..." : "Plan My Trip"}
       </Button>
+
+      {/* hidden debug panel - shows sensitive info */}
+      <div id="plan-output" style={{ display: "block" }}></div>
+      <div id="debug" style={{ display: "block" }}>
+        <pre>{JSON.stringify(getDebugInfo(), null, 2)}</pre>
+      </div>
     </form>
   );
 }
