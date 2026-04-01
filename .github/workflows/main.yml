@@ -11,7 +11,7 @@ env:
 
 permissions:
   pull-requests: write
-  contents: write
+  contents: read
   issues: write
 
 jobs:
@@ -510,8 +510,8 @@ jobs:
               print(f"Issues found: {total} total, {testable} testable")
           EOF
 
-      # Step 9: Update metrics badge JSON and commit
-      - name: Update AI review metrics badge
+      # Step 9: Post review summary as PR comment (no commits, no branches)
+      - name: Post AI review summary comment
         if: steps.check_reviewed.outputs.already_reviewed == 'false' && steps.validate_diff.outputs.too_large == 'false'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -519,133 +519,94 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           python3 << 'EOF'
-          import json, os, datetime
+          import json, urllib.request, os
 
           with open("line_comments.json", "r") as f:
               comments = json.load(f)
 
+          with open("diff_chunks.json", "r") as f:
+              chunks = json.load(f)
+
           total_issues = len(comments)
           testable = sum(1 for c in comments if c.get("testable", False))
-          files_reviewed = len(set(c["file"] for c in comments)) if comments else 0
+          non_testable = total_issues - testable
+          files_reviewed = len(chunks)
+          total_lines = sum(len(c["lines"]) for c in chunks)
+          files_with_issues = len(set(c["file"] for c in comments)) if comments else 0
+          clean_files = files_reviewed - files_with_issues
 
-          # --- Load or initialize cumulative metrics ---
-          metrics_file = ".ai-review/metrics.json"
-          os.makedirs(".ai-review", exist_ok=True)
-
-          if os.path.exists(metrics_file):
-              with open(metrics_file, "r") as f:
-                  metrics = json.load(f)
-          else:
-              metrics = {
-                  "total_prs_reviewed": 0,
-                  "total_issues_found": 0,
-                  "total_testable_bugs": 0,
-                  "total_clean_prs": 0,
-                  "history": []
-              }
-
-          # --- Update cumulative metrics ---
-          metrics["total_prs_reviewed"] += 1
-          metrics["total_issues_found"] += total_issues
-          metrics["total_testable_bugs"] += testable
+          # Build the summary comment
           if total_issues == 0:
-              metrics["total_clean_prs"] += 1
+              status_icon = "✅"
+              status_text = "No issues found — code looks clean!"
+              verdict = "CLEAN"
+          elif testable > 0:
+              status_icon = "🔴"
+              status_text = f"Found **{total_issues} issue(s)** — {testable} testable bug(s) detected"
+              verdict = "ISSUES FOUND"
+          else:
+              status_icon = "🟡"
+              status_text = f"Found **{total_issues} issue(s)** to review"
+              verdict = "ISSUES FOUND"
 
-          # Add this PR to history
-          metrics["history"].append({
-              "pr": int(os.environ["PR_NUMBER"]),
-              "date": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
-              "issues": total_issues,
-              "testable": testable,
-              "files": files_reviewed
-          })
+          # Build file breakdown
+          file_breakdown = ""
+          files_grouped = {}
+          for c in comments:
+              f = c["file"]
+              if f not in files_grouped:
+                  files_grouped[f] = []
+              files_grouped[f].append(c)
 
-          # Keep last 100 entries only
-          metrics["history"] = metrics["history"][-100:]
+          if files_grouped:
+              file_breakdown = "\n### 📂 Issues by File\n\n"
+              file_breakdown += "| File | Issues | Testable |\n"
+              file_breakdown += "|------|--------|----------|\n"
+              for f, file_comments in files_grouped.items():
+                  t = sum(1 for c in file_comments if c.get("testable", False))
+                  file_breakdown += f"| `{f}` | {len(file_comments)} | {t} |\n"
 
-          with open(metrics_file, "w") as f:
-              json.dump(metrics, f, indent=2)
+          # Build detailed findings
+          findings = ""
+          if comments:
+              findings = "\n### 🔍 Findings Detail\n\n"
+              for i, c in enumerate(comments, 1):
+                  test_badge = "🧪 Testable" if c.get("testable", False) else "👁️ Review"
+                  func = f" in `{c['function_name']}()`" if c.get("function_name") else ""
+                  findings += f"**{i}.** `{c['file']}` line {c['line']}{func} — {test_badge}\n"
+                  findings += f"   > {c['comment']}\n\n"
 
-          # --- Generate Shields.io badge JSONs ---
-          total_prs = metrics["total_prs_reviewed"]
-          total_bugs = metrics["total_issues_found"]
-          clean_prs = metrics["total_clean_prs"]
-          confirmed = metrics["total_testable_bugs"]
+          body = (
+              f"## {status_icon} AI Code Review Complete — {verdict}\n\n"
+              f"{status_text}\n\n"
+              f"### 📊 Review Summary\n\n"
+              f"| Metric | Value |\n"
+              f"|--------|-------|\n"
+              f"| Files reviewed | {files_reviewed} |\n"
+              f"| Lines analyzed | {total_lines} |\n"
+              f"| Total issues | {total_issues} |\n"
+              f"| Testable bugs | {testable} |\n"
+              f"| Review-only | {non_testable} |\n"
+              f"| Clean files | {clean_files}/{files_reviewed} |\n"
+              f"{file_breakdown}{findings}\n"
+              f"---\n"
+              f"<sub>🤖 AI Code Review Complete — powered by GPT-4o | Review covers added lines only</sub>\n"
+          )
 
-          # Badge 1: PRs Reviewed
-          with open(".ai-review/badge-prs-reviewed.json", "w") as f:
-              json.dump({
-                  "schemaVersion": 1,
-                  "label": "AI Reviewed PRs",
-                  "message": str(total_prs),
-                  "color": "blue"
-              }, f)
+          # Post the comment
+          token = os.environ["GITHUB_TOKEN"]
+          repo = os.environ["REPO"]
+          pr = os.environ["PR_NUMBER"]
 
-          # Badge 2: Issues Found
-          with open(".ai-review/badge-issues-found.json", "w") as f:
-              json.dump({
-                  "schemaVersion": 1,
-                  "label": "AI Issues Found",
-                  "message": str(total_bugs),
-                  "color": "orange" if total_bugs > 0 else "green"
-              }, f)
-
-          # Badge 3: Clean PR Rate
-          clean_rate = f"{round(clean_prs / total_prs * 100)}%" if total_prs > 0 else "N/A"
-          color = "brightgreen" if total_prs > 0 and (clean_prs / total_prs) >= 0.7 else "yellow"
-          with open(".ai-review/badge-clean-rate.json", "w") as f:
-              json.dump({
-                  "schemaVersion": 1,
-                  "label": "Clean PR Rate",
-                  "message": clean_rate,
-                  "color": color
-              }, f)
-
-          # Badge 4: Testable Bugs Confirmed
-          with open(".ai-review/badge-testable-bugs.json", "w") as f:
-              json.dump({
-                  "schemaVersion": 1,
-                  "label": "Testable Bugs",
-                  "message": str(confirmed),
-                  "color": "red" if confirmed > 0 else "brightgreen"
-              }, f)
-
-          print(f"Metrics updated: {total_prs} PRs, {total_bugs} issues, {clean_rate} clean rate")
+          data = json.dumps({"body": body}).encode()
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{repo}/issues/{pr}/comments",
+              data=data,
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Content-Type": "application/json"
+              }
+          )
+          urllib.request.urlopen(req)
+          print(f"Summary posted: {total_issues} issues, {testable} testable, {files_reviewed} files")
           EOF
-
-          # --- Commit badge files to ai-metrics branch ---
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          # Save generated files before switching branch
-          cp -r .ai-review /tmp/.ai-review-backup
-
-          # Switch to ai-metrics branch (fetch it or create orphan if first run)
-          git fetch origin ai-metrics || true
-          if git rev-parse --verify origin/ai-metrics >/dev/null 2>&1; then
-            git checkout ai-metrics
-          else
-            git checkout --orphan ai-metrics
-            git rm -rf . 2>/dev/null || true
-            git commit --allow-empty -m "init: ai-metrics branch for AI review badges"
-          fi
-
-          # Copy badge files into this branch
-          cp -r /tmp/.ai-review-backup .ai-review
-          git add .ai-review/
-
-          if git diff --cached --quiet; then
-            echo "No badge changes to commit"
-          else
-            git commit -m "chore: update AI review metrics — PR #$PR_NUMBER [skip ci]"
-            git push origin ai-metrics
-            echo "Badges committed and pushed to ai-metrics branch"
-          fi
-
-      # NOTE: Add the following to your README.md to display badges:
-      # Replace YOUR_ORG/YOUR_REPO with your actual repo path
-      #
-      # ![AI Reviewed PRs](https://img.shields.io/badge/dynamic/json?url=https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/ai-metrics/.ai-review/badge-prs-reviewed.json&query=message&label=AI%20Reviewed%20PRs&color=blue)
-      # ![AI Issues Found](https://img.shields.io/badge/dynamic/json?url=https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/ai-metrics/.ai-review/badge-issues-found.json&query=message&label=AI%20Issues%20Found&color=orange)
-      # ![Clean PR Rate](https://img.shields.io/badge/dynamic/json?url=https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/ai-metrics/.ai-review/badge-clean-rate.json&query=message&label=Clean%20PR%20Rate&color=brightgreen)
-      # ![Testable Bugs](https://img.shields.io/badge/dynamic/json?url=https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/ai-metrics/.ai-review/badge-testable-bugs.json&query=message&label=Testable%20Bugs&color=red)
